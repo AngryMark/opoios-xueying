@@ -172,3 +172,19 @@ jobs:
           path: |
             ${{ env.WORK }}/kernel/kernel.macho
             ${{ env.WORK }}/kernel/*.json
+      - name: release reference
+        # OPOIOS: the RELEASE LTO comparison kernel the prelink matching reads; the Linux toolchain has no libLTO to build it.
+        # It follows the XNU source, patches and kernel config, not the board archives, so a PC build can reuse it while only
+        # board code changes. With it: this run's native DEVELOPMENT kernel and matcher maps, to check the PC's matching.
+        # 7 days: the free plan's artifact storage is small.
+        uses: actions/upload-artifact@v4
+        with:
+          name: xueying-ios27-reference
+          retention-days: 7
+          if-no-files-found: error
+          include-hidden-files: true
+          path: |
+            ${{ env.WORK }}/tree/build/xnu/fileset-reference/mach.release.bcm2837.unstripped.noctf
+            ${{ env.WORK }}/tree/build/xnu/fileset-reference/mach.release.bcm2837.unstripped.json
+            ${{ env.WORK }}/tree/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped.noctf
+            ${{ env.WORK }}/kernel/.prelink-*/*.json
