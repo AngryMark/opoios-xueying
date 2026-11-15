@@ -114,12 +114,16 @@ void clock_get_uptime(uint64_t *result);
 void absolutetime_to_nanoseconds(uint64_t abstime, uint64_t *result);
 // Image4MonitorAbsent.c: calls of Image4::start's per-slot TXM call (it reaches them only in its slot loop).
 extern volatile uint32_t opoios_image4_monitor_calls;
+// BootProcessProbe.c: the kernel thread waiting inside Image4's code, with its frames (try-locks only).
+void opoios_image4_thread(char *out, size_t size);
 boolean_t ml_validate_nofault(vm_offset_t virtsrc, vm_size_t size);
 }
 
-// OPOIOS: AppleImage4's userspace cork and Image4's start (stage 3, device 2026-11-15). The sysctl "activate" polls bit 0 of the
-// byte at +16 of the object whose pointer AppleImage4 keeps at 0xfffffff008071b00 (its del2 state +64). Its export
-// 0xfffffff008fe301c, called only by Image4::start, sets that byte through the pointer at 0xfffffff008071b40. Image4's __DATA
+// OPOIOS: AppleImage4's userspace cork and Image4's start (stage 3, device 2026-11-15). launchd waits in AppleImage4's sysctl
+// "ignition_blob" (handler 0xfffffff008fdf00c), which polls bit 0 of the byte at +16 of the object its getter
+// 0xfffffff008fe2f1c ("get userspace cork") reads from 0xfffffff008071b40 (del2 state +128). The export 0xfffffff008fe301c,
+// called only by Image4::start, sets that byte through the same pointer. 0xfffffff008071b00 (state +64) is another object of
+// that state, kept in the row for comparison. Image4's __DATA
 // keeps the magazine slot count (0xfffffff00b97fc40) and a byte it sets after the slot loop and the uncork call
 // (0xfffffff00b97fc48). Static addresses of the 24A446 collection, which the fileset keeps in this kernel, plus the kernel
 // slide; every read is checked with ml_validate_nofault, and the row only reads, without locks (the report thread uses it).
@@ -146,11 +150,11 @@ static void opoios_image4_row(char *out, size_t size)
     uint8_t done = 0xff;
     const bool haveSlots = opoios_peek(0xfffffff00b97fc40ULL + vm_kernel_slide, &slots, sizeof slots);
     const bool haveDone = opoios_peek(0xfffffff00b97fc48ULL + vm_kernel_slide, &done, sizeof done);
-    int n = snprintf(out, size, "OPOIOS I4 mon %u slots %lld done %d cork(activate)", (unsigned)opoios_image4_monitor_calls,
+    int n = snprintf(out, size, "OPOIOS I4 mon %u slots %lld done %d cork", (unsigned)opoios_image4_monitor_calls,
                      haveSlots ? (long long)slots : -1LL, haveDone ? (int)done : -1);
-    if (n > 0 && (size_t)n + 24 < size) n += opoios_cork(out + n, size - (size_t)n, 0xfffffff008071b00ULL);
-    if (n > 0 && (size_t)n + 32 < size) n += snprintf(out + n, size - (size_t)n, " cork(uncork)");
-    if (n > 0 && (size_t)n + 24 < size) opoios_cork(out + n, size - (size_t)n, 0xfffffff008071b40ULL);
+    if (n > 0 && (size_t)n + 24 < size) n += opoios_cork(out + n, size - (size_t)n, 0xfffffff008071b40ULL);
+    if (n > 0 && (size_t)n + 32 < size) n += snprintf(out + n, size - (size_t)n, " s64");
+    if (n > 0 && (size_t)n + 24 < size) opoios_cork(out + n, size - (size_t)n, 0xfffffff008071b00ULL);
 }
 
 static uint64_t opoios_uptime_seconds(void)
@@ -233,7 +237,7 @@ static void opoios_sampler(void *, wait_result_t)
 static void opoios_sys_report(void *argument, wait_result_t)
 {
     const unsigned limit = (unsigned)(uintptr_t)argument;
-    static char sys[640], pid1[160], image4[360], cached[200], trace[200];
+    static char sys[640], pid1[160], image4[360], cached[200], trace[200], image4Thread[260];
     uint64_t at = 0;
     for (unsigned elapsed = 0; elapsed < limit;) {
         const unsigned step = limit - elapsed < 15 ? limit - elapsed : 15;
@@ -241,6 +245,8 @@ static void opoios_sys_report(void *argument, wait_result_t)
         elapsed += step;
         opoios_image4_row(image4, sizeof image4);
         printf("%s\n", image4);
+        opoios_image4_thread(image4Thread, sizeof image4Thread);
+        printf("OPOIOS I4T %s\n", image4Thread);
         opoios_launchd_cached(cached, sizeof cached, trace, sizeof trace);
         printf("OPOIOS LD %s%s%s\n", cached, trace[0] ? " | " : "", trace);
         if (!__atomic_exchange_n(&opoios_publish_lock, 1u, __ATOMIC_ACQUIRE)) {
@@ -254,8 +260,8 @@ static void opoios_sys_report(void *argument, wait_result_t)
                (unsigned)opoios_sampler_step, pid1);
         printf("%s\n", sys);
     }
-    panic("%s\nOPOIOS LD %s | %s\nOPOIOS SAMPLE at %llus step %u | %s\n%s", image4, cached, trace, (unsigned long long)at,
-          (unsigned)opoios_sampler_step, pid1, sys);
+    panic("%s\nOPOIOS I4T %s\nOPOIOS LD %s | %s\nOPOIOS SAMPLE at %llus step %u | %s\n%s", image4, image4Thread, cached, trace,
+          (unsigned long long)at, (unsigned)opoios_sampler_step, pid1, sys);
 }
 
 static void opoios_sys_report_start(void)

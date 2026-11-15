@@ -186,6 +186,53 @@ void opoios_launchd_cached(char *out,size_t size,char *trace,size_t tsize) {
  int n=snprintf(out,size,"launchd task(first seen)");
  if(n>0 && (size_t)n<size)opoios_task_row(task,out+n,size-(size_t)n,trace,tsize);
 }
+// OPOIOS: the kernel thread inside Image4's code (device 2026-11-15 21:17: Image4::start had set up its 12 magazine slots but
+// made no per-slot TXM call and never uncorked AppleImage4's userspace, so launchd's sysctl ignition_blob kept waiting).
+// kernel_task's threads with try-locks only: the first waiting one with a kernel frame returning into Image4's __TEXT_EXEC
+// (the 24A446 fileset range, which this kernel keeps, plus the slide). Its name, wait event, state, and the frames from three
+// before the first Image4 one (low 36 bits, as opoios_trace). For the report thread.
+extern task_t kernel_task;
+extern vm_offset_t vm_kernel_slide;
+void opoios_image4_thread(char *out,size_t size) {
+ const uint64_t lo=0xfffffff00a8697a0ULL+vm_kernel_slide,hi=lo+0x11358;
+ task_t task=kernel_task;
+ if(!task || !task_lock_try(task)){snprintf(out,size,"i4 thread: kernel_task busy");return;}
+ unsigned count=0,waiting=0,busy=0,found=0;
+ thread_t thread;
+ queue_iterate(&task->threads,thread,thread_t,task_threads){
+  if(count++>=4096)break;
+  bool irq=ml_set_interrupts_enabled(false);
+  if(!simple_lock_try(&thread->sched_lock,&thread_lck_grp)){++busy;ml_set_interrupts_enabled(irq);continue;}
+  if(thread->state&TH_WAIT) {
+   ++waiting;
+   thread_kernel_state_t st=(thread_kernel_state_t)thread->machine.kstackptr;
+   const uint64_t base=(uint64_t)thread->kernel_stack,top=base+(uint64_t)kernel_stack_size;
+   uint64_t frames[32];unsigned depth=0;int first=-1;
+   if(st && base) {
+    frames[depth++]=opoios_strip(st->machine.ss.lr);
+    uint64_t fp=st->machine.ss.fp;
+    while(depth<32 && fp>=base && fp+16<=top && !(fp&7)) {
+     const uint64_t *frame=(const uint64_t *)fp;
+     frames[depth++]=opoios_strip(frame[1]);
+     if(frame[0]<=fp)break;
+     fp=frame[0];
+    }
+    for(unsigned i=0;i<depth && first<0;++i)if(frames[i]>=lo && frames[i]<hi)first=(int)i;
+   }
+   if(first>=0) {
+    char name[64]={};thread_get_thread_name(thread,name);
+    int n=snprintf(out,size,"i4 thread %.24s W%llx s%x d%u:",name,(unsigned long long)thread->wait_event,(unsigned)thread->state,depth);
+    for(unsigned i=first>3?(unsigned)first-3:0;i<depth && n>0 && (size_t)n+12<size;++i)
+     n+=snprintf(out+n,size-(size_t)n," %09llx",(unsigned long long)(frames[i]&0xfffffffffULL));
+    found=1;
+   }
+  }
+  thread_unlock(thread);ml_set_interrupts_enabled(irq);
+  if(found)break;
+ }
+ task_unlock(task);
+ if(!found)snprintf(out,size,"i4 thread: none of %u kernel threads (%u waiting, %u busy) is in Image4",count,waiting,busy);
+}
 void boot_process_capture(void) {
  // Exactly one capture worker. Refuse reentry without waiting or modifying its
  // partial results, including in host failure-injection checks.
