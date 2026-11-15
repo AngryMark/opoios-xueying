@@ -40,7 +40,7 @@ namespace {
 constexpr unsigned kScale = 3;          // 18 x 42 pixel cells: 70 columns on the 1264-pixel panel
 constexpr unsigned kRows = 48;          // the rows BootProgressDisplay.h keeps
 constexpr unsigned kLogFirst = 6;       // rows 6..47 hold the log
-constexpr unsigned kDiagRows = 12;      // OPOIOS: the last 12 of them hold the diagnostic rows when opoios_screen_text exists
+constexpr unsigned kDiagRows = 18;      // OPOIOS: the last 18 of them hold the diagnostic rows when opoios_screen_text exists
 constexpr uint32_t kDiag = 0x0080ff80;
 constexpr unsigned kTail = 16384;       // bytes of the message buffer looked at
 constexpr unsigned kLimitSeconds = 3600;
@@ -172,7 +172,7 @@ void run(void *, wait_result_t) {
     // OPOIOS: with the diagnostic hook the log keeps the rows above the last kDiagRows.
     const bool diag = &opoios_screen_text != nullptr;
     const unsigned logRows = kRows - kLogFirst - (diag ? kDiagRows : 0);
-    static char diagText[1600];
+    static char diagText[2400];
     static char diagLines[kDiagRows][BP_COLS];
     for (unsigned step = 0;; ++step) {
         int drew = iosDrew();

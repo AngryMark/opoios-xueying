@@ -237,14 +237,69 @@ static void opoios_sampler(void *, wait_result_t)
 // OPOIOS: where the report thread is: iterations * 10 + the line it is printing (1 I4, 2 I4T, 3 LD, 4 SAMPLE, 5 SYS, 9 between).
 static volatile uint32_t opoios_report_mark;
 
+// OPOIOS: a panic that never finishes (device 2026-11-15 22:07: from about 52 s a panic screen started to draw, its first line
+// beginning with "Image4, while the other CPUs kept running; the sampler's 3 s sleep never ended and the report's own final
+// panic stopped). XNU's debugger globals, read by address (asm labels, so no header declaration can clash) and only through
+// ml_validate_nofault: the CPU in the debugger, the CPUs spinning, debugger acknowledgement timeouts, the panic caller, the
+// format string and its first three arguments (Darwin arm64 passes them in 8-byte stack slots), and the panic log's start.
+extern "C" {
+extern char opoios_k_debugger_cpu[] __asm__("_debugger_cpu");
+extern char opoios_k_debug_cpus_spinning[] __asm__("_debug_cpus_spinning");
+extern char opoios_k_debug_ack_timeout_count[] __asm__("_debug_ack_timeout_count");
+extern char opoios_k_debugger_panic_caller[] __asm__("_debugger_panic_caller");
+extern char opoios_k_debugger_panic_str[] __asm__("_debugger_panic_str");
+extern char opoios_k_debugger_panic_args[] __asm__("_debugger_panic_args");
+extern char opoios_k_debug_buf_base[] __asm__("_debug_buf_base");
+}
+
+static void opoios_peek_text(uint64_t address, char *out, size_t size)
+{
+    out[0] = 0;
+    if (!address || size < 2) return;
+    size_t take = size - 1;
+    while (take && !opoios_peek(address, out, take)) take /= 2;  // a string near the end of a mapping
+    out[take] = 0;
+    for (size_t i = 0; i < take; ++i) {
+        if (!out[i]) break;
+        if (out[i] == '\n' || out[i] == '\r' || out[i] == '\t') out[i] = ' ';
+        else if ((unsigned char)out[i] < 32 || (unsigned char)out[i] > 126) out[i] = '.';
+    }
+}
+
+static void opoios_panic_row(char *out, size_t size)
+{
+    int32_t cpu = -2;
+    uint32_t spinning = 0, ackTimeouts = 0;
+    uint64_t caller = 0, format = 0, args = 0, base = 0, list = 0, slot[3] = {};
+    opoios_peek((uint64_t)opoios_k_debugger_cpu, &cpu, sizeof cpu);
+    opoios_peek((uint64_t)opoios_k_debug_cpus_spinning, &spinning, sizeof spinning);
+    opoios_peek((uint64_t)opoios_k_debug_ack_timeout_count, &ackTimeouts, sizeof ackTimeouts);
+    opoios_peek((uint64_t)opoios_k_debugger_panic_caller, &caller, sizeof caller);
+    opoios_peek((uint64_t)opoios_k_debugger_panic_str, &format, sizeof format);
+    opoios_peek((uint64_t)opoios_k_debugger_panic_args, &args, sizeof args);
+    opoios_peek((uint64_t)opoios_k_debug_buf_base, &base, sizeof base);
+    if (!format && !caller) {
+        snprintf(out, size, "PANIC none (debugger cpu %d spin %u ackto %u)", cpu, spinning, ackTimeouts);
+        return;
+    }
+    if (args && opoios_peek(args, &list, sizeof list) && list) opoios_peek(list, slot, sizeof slot);
+    static char text[112], log[232];
+    opoios_peek_text(format, text, sizeof text);
+    opoios_peek_text(base, log, sizeof log);
+    snprintf(out, size, "PANIC cpu %d spin %u ackto %u caller %llx fmt \"%s\" a %llx %llx %llx | log %s", cpu, spinning, ackTimeouts,
+             (unsigned long long)caller, text, (unsigned long long)slot[0], (unsigned long long)slot[1],
+             (unsigned long long)slot[2], log);
+}
+
 // OPOIOS: the diagnostic rows for AstonBootScreen.cpp, which draws them itself every 3 s: in two device runs (2026-11-15 20:44,
 // 21:39) no report row reached the message buffer while the screen's clock ran. Lock-free state only, one caller (the screen
 // thread): the Image4 row, the kernel thread inside Image4, launchd through its first task, and the sampler's pid 1 copy with
 // its uptime and step, and the report thread's mark.
 extern "C" unsigned opoios_screen_text(char *out, unsigned size)
 {
-    static char image4[200], image4Thread[260], cached[200], trace[200], pid1[160];
+    static char image4[200], image4Thread[260], cached[200], trace[200], pid1[160], panicRow[560];
     uint64_t at = 0;
+    opoios_panic_row(panicRow, sizeof panicRow);
     opoios_image4_row(image4, sizeof image4);
     opoios_image4_thread(image4Thread, sizeof image4Thread);
     opoios_launchd_cached(cached, sizeof cached, trace, sizeof trace);
@@ -253,8 +308,8 @@ extern "C" unsigned opoios_screen_text(char *out, unsigned size)
         at = opoios_published_at;
         __atomic_store_n(&opoios_publish_lock, 0u, __ATOMIC_RELEASE);
     }
-    const int n = snprintf(out, size, "%s\nI4T %s\nLD %s%s%s\nSAMPLE now %llus at %llus step %u report %u | %s", image4,
-                           image4Thread, cached, trace[0] ? " | " : "", trace, (unsigned long long)opoios_uptime_seconds(),
+    const int n = snprintf(out, size, "%s\n%s\nI4T %s\nLD %s%s%s\nSAMPLE now %llus at %llus step %u report %u | %s", panicRow,
+                           image4, image4Thread, cached, trace[0] ? " | " : "", trace, (unsigned long long)opoios_uptime_seconds(),
                            (unsigned long long)at, (unsigned)opoios_sampler_step, (unsigned)opoios_report_mark, pid1);
     return n > 0 ? (unsigned)n : 0;
 }
