@@ -114,7 +114,11 @@ kernel_args = [
   "offline-mobile-graphics-load=1", "offline-mobile-graphics-client=1", "offline-legacy-register=1", "offline-legacy-gop=1",
   "offline-legacy-unit-scale=3", "offline-legacy-pm=1", "offline-legacy-validate=1", "offline-legacy-transfer=1",
   "offline-legacy-cpu-present=1", "offline-legacy-phase=4", "offline-key-events=1", "sheng-buttons=1",
-  "smp=1", "armcpu-spi-ipi=1", "armcpu-self-ipi=1",
+  # OPOIOS: one CPU for now (smp=0: ArmCpu starts no secondary core). With smp=1 the boot hung right after launchd started
+  # (device 2026-11-15, five runs): Image4::start stopped after its magazine slots with no thread waiting in its code, a worker's
+  # 3 s IOSleep never returned and printf sometimes blocked, as if wakeup IPIs to idle cores were lost (UniXNU's xnu carries a
+  # "sheng: ... lost the self-IPI" workaround for this SoC family). On one CPU the same boot runs to restored_external.
+  "smp=0", "armcpu-spi-ipi=1", "armcpu-self-ipi=1",
   "no-lc=1", "vsync=60", "vsync-fixed=1", "sheng-disable-watchdogd=1", "sheng-lite=1",
 ]
 
@@ -159,6 +163,13 @@ vmm-present = 1
 [adt.chosen.u32]
 # SM8550 has no CTRR.
 kernel-ctrr-to-be-enabled = 0
+
+[adt.chosen.bytes]
+# OPOIOS: the hash of the boot manifest (sha2-384, crypto-hash-method). Image4::start's magazine needs it: without it the start
+# panics "Image4: unable to initialize magazine: 7" (device 2026-11-15, one CPU), the userspace cork stays shut and launchd waits
+# in AppleImage4's sysctl ignition_blob. This boot has no Apple manifest (IM4M): the value is the owner's own, SHA-384 of the
+# fixed label "OPOIOS owner boot manifest v1 (no Apple ticket)", with no device identifier, and claims no Apple ticket.
+boot-manifest-hash = "ab094f555b2987c29f157a7b7f99a107e4d98cd395b73c560065e6c02b70c5d1e4b7833c00ca8cbbff5d6edbc40c81ee"
 
 [adt.buttons.string]
 compatible = "buttons"
