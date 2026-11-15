@@ -119,6 +119,44 @@ static int capture(proc_t p,void *arg) {
  if(trace_slot[index] && boot_ui_trace_task)boot_ui_trace_task(task,index,proc_pid(p),name,slide);
  capture_seen=capture_seen+1;return PROC_RETURNED;
 }
+// OPOIOS: launchd (pid 1) sampled from the report thread itself, whatever the capture worker is doing. On the device
+// (2026-11-15 20:20, Image4 started) the published pass had no launchd at all: a stuck or starved worker, or a launchd the
+// process pass skips (a proc in fork/exec transition). Same fields as the capture row; X is proc_exiting. A waiting first
+// thread also refreshes opoios_launchd_trace. Called only by SourceStorage.cpp's report, one caller at a time.
+struct proc *proc_find(int);
+int proc_rele(proc_t);
+int proc_exiting(proc_t);
+char opoios_launchd_direct[150];
+void opoios_launchd_sample(void) {
+ char *out=opoios_launchd_direct;const size_t size=sizeof(opoios_launchd_direct);
+ proc_t p=proc_find(1);
+ if(!p){snprintf(out,size,"pid1 absent");return;}
+ const char *name=proc_best_name(p);
+ task_t task=proc_task(p);
+ if(!task || !task_lock_try(task)) {
+  snprintf(out,size,"pid1 %.15s X%d task %s",name,proc_exiting(p),task?"busy":"none");proc_rele(p);return;
+ }
+ unsigned count=0,running=0,waiting=0,busy=0,state=0;int priority=0;
+ uint64_t wait=0,continuation=0,userPC=0;
+ thread_t thread;
+ queue_iterate(&task->threads,thread,thread_t,task_threads){
+  if(count++>=128)break;
+  bool irq=ml_set_interrupts_enabled(false);
+  if(!simple_lock_try(&thread->sched_lock,&thread_lck_grp)){++busy;ml_set_interrupts_enabled(irq);continue;}
+  unsigned flags=(unsigned)thread->state;
+  running+=(flags&TH_RUN)!=0;waiting+=(flags&TH_WAIT)!=0;
+  if(count==1){
+   state=flags;priority=thread->sched_pri;wait=thread->wait_event;continuation=(uint64_t)thread->continuation;
+   if(thread->machine.upcb)userPC=(uint64_t)get_saved_state_pc(thread->machine.upcb);
+   if(flags&TH_WAIT)opoios_trace(thread);
+  }
+  thread_unlock(thread);ml_set_interrupts_enabled(irq);
+ }
+ unsigned total=(unsigned)task->thread_count;task_unlock(task);
+ snprintf(out,size,"pid1 %.15s X%d n%u r%u w%u b%u s%x/%d W%llx C%llx U%llx",name,proc_exiting(p),total,running,waiting,busy,
+  state,priority,(unsigned long long)wait,(unsigned long long)continuation,(unsigned long long)userPC);
+ proc_rele(p);
+}
 void boot_process_capture(void) {
  // Exactly one capture worker. Refuse reentry without waiting or modifying its
  // partial results, including in host failure-injection checks.

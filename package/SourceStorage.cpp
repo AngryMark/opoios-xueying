@@ -105,6 +105,55 @@ void boot_process_snapshot(void);
 extern char boot_process_rows[10][120];
 // The same capture's OPOIOS row for a waiting launchd: system call (x16, x0) and kernel return addresses (low 36 bits).
 extern char opoios_launchd_trace[200];
+// launchd (pid 1) sampled directly by the report thread (BootProcessProbe.c), for a capture pass that misses it.
+void opoios_launchd_sample(void);
+extern char opoios_launchd_direct[150];
+// Image4MonitorAbsent.c: calls of Image4::start's per-slot TXM call (it reaches them only in its slot loop).
+extern volatile uint32_t opoios_image4_monitor_calls;
+boolean_t ml_validate_nofault(vm_offset_t virtsrc, vm_size_t size);
+}
+
+// OPOIOS: AppleImage4's userspace cork and Image4's start (stage 3, device 2026-11-15). The sysctl "activate" polls bit 0 of the
+// byte at +16 of the object whose pointer AppleImage4 keeps at 0xfffffff008071b00 (its del2 state +64). Its export
+// 0xfffffff008fe301c, called only by Image4::start, sets that byte through the pointer at 0xfffffff008071b40. Image4's __DATA
+// keeps the magazine slot count (0xfffffff00b97fc40) and a byte it sets after the slot loop and the uncork call
+// (0xfffffff00b97fc48). Static addresses of the 24A446 collection, which the fileset keeps in this kernel, plus the kernel
+// slide; every read is checked with ml_validate_nofault, and the row only reads.
+static bool opoios_peek(uint64_t address, void *out, size_t size)
+{
+    if (address < 0xfffffff000000000ULL || !ml_validate_nofault((vm_offset_t)address, (vm_size_t)size)) return false;
+    __builtin_memcpy(out, (const void *)address, size);
+    return true;
+}
+
+static int opoios_cork(char *out, size_t size, uint64_t slot)
+{
+    uint64_t object = 0;
+    uint8_t flag = 0;
+    if (!opoios_peek(slot + vm_kernel_slide, &object, sizeof object)) return snprintf(out, size, " ?");
+    if (!object) return snprintf(out, size, " 0");
+    if (!opoios_peek(object + 16, &flag, sizeof flag)) return snprintf(out, size, " %llx:?", (unsigned long long)object);
+    return snprintf(out, size, " %llx:%x", (unsigned long long)object, flag);
+}
+
+static void opoios_image4_row(char *out, size_t size)
+{
+    unsigned instances = 0;
+    const OSSymbol *name = OSSymbol::withCString("Image4");
+    const OSMetaClass *meta = name ? OSMetaClass::getMetaClassWithName(name) : nullptr;
+    if (name) name->release();
+    if (meta) instances = meta->getInstanceCount();
+    uint64_t slots = 0;
+    uint8_t done = 0xff;
+    const bool haveSlots = opoios_peek(0xfffffff00b97fc40ULL + vm_kernel_slide, &slots, sizeof slots);
+    const bool haveDone = opoios_peek(0xfffffff00b97fc48ULL + vm_kernel_slide, &done, sizeof done);
+    int n = snprintf(out, size, "OPOIOS I4 class %s inst %u mon %u slots %lld done %d cork(activate)",
+                     meta ? "yes" : "no", instances, (unsigned)opoios_image4_monitor_calls,
+                     haveSlots ? (long long)slots : -1LL, haveDone ? (int)done : -1);
+    if (n > 0 && (size_t)n + 24 < size) n += opoios_cork(out + n, size - (size_t)n, 0xfffffff008071b00ULL);
+    if (n > 0 && (size_t)n + 32 < size) n += snprintf(out + n, size - (size_t)n, " cork(uncork)");
+    if (n > 0 && (size_t)n + 24 < size) n += opoios_cork(out + n, size - (size_t)n, 0xfffffff008071b40ULL);
+    if (n > 0 && (size_t)n + 24 < size) snprintf(out + n, size - (size_t)n, " | %.150s", opoios_launchd_direct);
 }
 
 static void opoios_process_worker(void *, wait_result_t)
@@ -150,15 +199,18 @@ static void opoios_sys_row(char *out, size_t size, unsigned seconds)
 static void opoios_sys_report(void *argument, wait_result_t)
 {
     const unsigned limit = (unsigned)(uintptr_t)argument;
-    char row[640] = "";
+    char row[640] = "", image4[360] = "";
     for (unsigned elapsed = 0; elapsed < limit;) {
         const unsigned step = limit - elapsed < 15 ? limit - elapsed : 15;
         IOSleep(step * 1000);
         elapsed += step;
+        opoios_launchd_sample();
         opoios_sys_row(row, sizeof row, elapsed);
         printf("%s\n", row);
+        opoios_image4_row(image4, sizeof image4);
+        printf("%s\n", image4);
     }
-    panic("%s", row);
+    panic("%s\n%s", row, image4);
 }
 
 static void opoios_sys_report_start(void)
