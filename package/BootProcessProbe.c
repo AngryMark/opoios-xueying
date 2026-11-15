@@ -64,8 +64,10 @@ static uint64_t opoios_strip(uint64_t value) {
 #endif
  return value|0xfffffff000000000ULL;
 }
-static void opoios_trace(thread_t thread) {
- char *out=opoios_launchd_trace;const size_t size=sizeof(opoios_launchd_trace);
+static void opoios_trace_to(thread_t thread,char *out,size_t size);
+static void opoios_launchd_remember(task_t task);
+static void opoios_trace(thread_t thread) {opoios_trace_to(thread,opoios_launchd_trace,sizeof(opoios_launchd_trace));}
+static void opoios_trace_to(thread_t thread,char *out,size_t size) {
  int64_t number=0;uint64_t arg0=0;
  if(thread->machine.upcb){number=(int64_t)get_saved_state_reg(thread->machine.upcb,16);arg0=get_saved_state_reg(thread->machine.upcb,0);}
  int n=snprintf(out,size,"sys %lld x0 %llx",(long long)number,(unsigned long long)arg0);
@@ -91,6 +93,7 @@ static int capture(proc_t p,void *arg) {
  else if((index==4 && follow_pid[0]>0) || (index==1 && follow_pid[1]>0))index=10;
  if(index==10)return PROC_RETURNED;
  task_t task=proc_task(p);
+ if(index==0 && proc_pid(p)==1)opoios_launchd_remember(task);
  if(!task || !task_lock_try(task)) {
   snprintf(capture_rows[index],120,"%.18s p%d task unavailable/busy",name,proc_pid(p));return PROC_RETURNED;
  }
@@ -119,23 +122,29 @@ static int capture(proc_t p,void *arg) {
  if(trace_slot[index] && boot_ui_trace_task)boot_ui_trace_task(task,index,proc_pid(p),name,slide);
  capture_seen=capture_seen+1;return PROC_RETURNED;
 }
-// OPOIOS: launchd (pid 1) sampled from the report thread itself, whatever the capture worker is doing. On the device
-// (2026-11-15 20:20, Image4 started) the published pass had no launchd at all: a stuck or starved worker, or a launchd the
-// process pass skips (a proc in fork/exec transition). Same fields as the capture row; X is proc_exiting. A waiting first
-// thread also refreshes opoios_launchd_trace. Called only by SourceStorage.cpp's report, one caller at a time.
+// OPOIOS: launchd (pid 1) in two ways (stage 3, device 2026-11-15). The 20:20 run's published capture pass had no launchd at
+// all, and in the 20:44 run a report that sampled pid 1 through proc_find(1) first printed nothing for 11 minutes: proc_find
+// waits while the process is in exec (proc_ref_wait_for_exec). So:
+//  - opoios_launchd_sample, for SourceStorage.cpp's sampler worker, which may wait: proc_find(1), its task's first thread,
+//    and "T+" when pid 1 has another task than the one first seen (an exec replaced it);
+//  - opoios_launchd_cached, for the report thread, which must not wait: the task first seen for launchd (kept with a task
+//    reference, never released), sampled with try-locks only, so a launchd blocked in exec still shows its thread and stack.
+// Both write their own buffers; X is proc_exiting. The capture pass also remembers launchd's task.
 struct proc *proc_find(int);
 int proc_rele(proc_t);
 int proc_exiting(proc_t);
 char opoios_launchd_direct[150];
-void opoios_launchd_sample(void) {
- char *out=opoios_launchd_direct;const size_t size=sizeof(opoios_launchd_direct);
- proc_t p=proc_find(1);
- if(!p){snprintf(out,size,"pid1 absent");return;}
- const char *name=proc_best_name(p);
- task_t task=proc_task(p);
- if(!task || !task_lock_try(task)) {
-  snprintf(out,size,"pid1 %.15s X%d task %s",name,proc_exiting(p),task?"busy":"none");proc_rele(p);return;
- }
+static task_t opoios_launchd_task;
+static void opoios_launchd_remember(task_t task) {
+ if(!task || __atomic_load_n(&opoios_launchd_task,__ATOMIC_ACQUIRE))return;
+ task_reference(task);
+ task_t none=TASK_NULL;
+ if(!__atomic_compare_exchange_n(&opoios_launchd_task,&none,task,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))task_deallocate(task);
+}
+// The first thread of a task with try-locks: thread count, running/waiting/busy, state/priority, wait event (W),
+// continuation (C), user PC (U); a waiting first thread's system call and kernel stack go to trace.
+static int opoios_task_row(task_t task,char *out,size_t size,char *trace,size_t tsize) {
+ if(!task_lock_try(task))return snprintf(out,size," task busy");
  unsigned count=0,running=0,waiting=0,busy=0,state=0;int priority=0;
  uint64_t wait=0,continuation=0,userPC=0;
  thread_t thread;
@@ -148,14 +157,34 @@ void opoios_launchd_sample(void) {
   if(count==1){
    state=flags;priority=thread->sched_pri;wait=thread->wait_event;continuation=(uint64_t)thread->continuation;
    if(thread->machine.upcb)userPC=(uint64_t)get_saved_state_pc(thread->machine.upcb);
-   if(flags&TH_WAIT)opoios_trace(thread);
+   if((flags&TH_WAIT) && trace)opoios_trace_to(thread,trace,tsize);
   }
   thread_unlock(thread);ml_set_interrupts_enabled(irq);
  }
  unsigned total=(unsigned)task->thread_count;task_unlock(task);
- snprintf(out,size,"pid1 %.15s X%d n%u r%u w%u b%u s%x/%d W%llx C%llx U%llx",name,proc_exiting(p),total,running,waiting,busy,
-  state,priority,(unsigned long long)wait,(unsigned long long)continuation,(unsigned long long)userPC);
+ return snprintf(out,size," n%u r%u w%u b%u s%x/%d W%llx C%llx U%llx",total,running,waiting,busy,state,priority,
+  (unsigned long long)wait,(unsigned long long)continuation,(unsigned long long)userPC);
+}
+void opoios_launchd_sample(void) {
+ char *out=opoios_launchd_direct;const size_t size=sizeof(opoios_launchd_direct);
+ proc_t p=proc_find(1);
+ if(!p){snprintf(out,size,"pid1 absent");return;}
+ task_t task=proc_task(p);
+ opoios_launchd_remember(task);
+ int n=snprintf(out,size,"pid1 %.15s X%d%s",proc_best_name(p),proc_exiting(p),
+  task && task!=__atomic_load_n(&opoios_launchd_task,__ATOMIC_ACQUIRE)?" T+":"");
+ if(n>0 && (size_t)n<size) {
+  if(task)opoios_task_row(task,out+n,size-(size_t)n,opoios_launchd_trace,sizeof(opoios_launchd_trace));
+  else snprintf(out+n,size-(size_t)n," task none");
+ }
  proc_rele(p);
+}
+void opoios_launchd_cached(char *out,size_t size,char *trace,size_t tsize) {
+ task_t task=__atomic_load_n(&opoios_launchd_task,__ATOMIC_ACQUIRE);
+ if(trace && tsize)trace[0]=0;
+ if(!task){snprintf(out,size,"launchd task not seen yet");return;}
+ int n=snprintf(out,size,"launchd task(first seen)");
+ if(n>0 && (size_t)n<size)opoios_task_row(task,out+n,size-(size_t)n,trace,tsize);
 }
 void boot_process_capture(void) {
  // Exactly one capture worker. Refuse reentry without waiting or modifying its

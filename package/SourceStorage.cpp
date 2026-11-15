@@ -105,9 +105,13 @@ void boot_process_snapshot(void);
 extern char boot_process_rows[10][120];
 // The same capture's OPOIOS row for a waiting launchd: system call (x16, x0) and kernel return addresses (low 36 bits).
 extern char opoios_launchd_trace[200];
-// launchd (pid 1) sampled directly by the report thread (BootProcessProbe.c), for a capture pass that misses it.
+// launchd (pid 1), BootProcessProbe.c: through proc_find (may wait, for the sampler worker) and through the task first seen
+// for it (try-locks only, for the report thread).
 void opoios_launchd_sample(void);
 extern char opoios_launchd_direct[150];
+void opoios_launchd_cached(char *out, size_t size, char *trace, size_t tsize);
+void clock_get_uptime(uint64_t *result);
+void absolutetime_to_nanoseconds(uint64_t abstime, uint64_t *result);
 // Image4MonitorAbsent.c: calls of Image4::start's per-slot TXM call (it reaches them only in its slot loop).
 extern volatile uint32_t opoios_image4_monitor_calls;
 boolean_t ml_validate_nofault(vm_offset_t virtsrc, vm_size_t size);
@@ -118,7 +122,7 @@ boolean_t ml_validate_nofault(vm_offset_t virtsrc, vm_size_t size);
 // 0xfffffff008fe301c, called only by Image4::start, sets that byte through the pointer at 0xfffffff008071b40. Image4's __DATA
 // keeps the magazine slot count (0xfffffff00b97fc40) and a byte it sets after the slot loop and the uncork call
 // (0xfffffff00b97fc48). Static addresses of the 24A446 collection, which the fileset keeps in this kernel, plus the kernel
-// slide; every read is checked with ml_validate_nofault, and the row only reads.
+// slide; every read is checked with ml_validate_nofault, and the row only reads, without locks (the report thread uses it).
 static bool opoios_peek(uint64_t address, void *out, size_t size)
 {
     if (address < 0xfffffff000000000ULL || !ml_validate_nofault((vm_offset_t)address, (vm_size_t)size)) return false;
@@ -138,22 +142,23 @@ static int opoios_cork(char *out, size_t size, uint64_t slot)
 
 static void opoios_image4_row(char *out, size_t size)
 {
-    unsigned instances = 0;
-    const OSSymbol *name = OSSymbol::withCString("Image4");
-    const OSMetaClass *meta = name ? OSMetaClass::getMetaClassWithName(name) : nullptr;
-    if (name) name->release();
-    if (meta) instances = meta->getInstanceCount();
     uint64_t slots = 0;
     uint8_t done = 0xff;
     const bool haveSlots = opoios_peek(0xfffffff00b97fc40ULL + vm_kernel_slide, &slots, sizeof slots);
     const bool haveDone = opoios_peek(0xfffffff00b97fc48ULL + vm_kernel_slide, &done, sizeof done);
-    int n = snprintf(out, size, "OPOIOS I4 class %s inst %u mon %u slots %lld done %d cork(activate)",
-                     meta ? "yes" : "no", instances, (unsigned)opoios_image4_monitor_calls,
+    int n = snprintf(out, size, "OPOIOS I4 mon %u slots %lld done %d cork(activate)", (unsigned)opoios_image4_monitor_calls,
                      haveSlots ? (long long)slots : -1LL, haveDone ? (int)done : -1);
     if (n > 0 && (size_t)n + 24 < size) n += opoios_cork(out + n, size - (size_t)n, 0xfffffff008071b00ULL);
     if (n > 0 && (size_t)n + 32 < size) n += snprintf(out + n, size - (size_t)n, " cork(uncork)");
-    if (n > 0 && (size_t)n + 24 < size) n += opoios_cork(out + n, size - (size_t)n, 0xfffffff008071b40ULL);
-    if (n > 0 && (size_t)n + 24 < size) snprintf(out + n, size - (size_t)n, " | %.150s", opoios_launchd_direct);
+    if (n > 0 && (size_t)n + 24 < size) opoios_cork(out + n, size - (size_t)n, 0xfffffff008071b40ULL);
+}
+
+static uint64_t opoios_uptime_seconds(void)
+{
+    uint64_t now = 0, ns = 0;
+    clock_get_uptime(&now);
+    absolutetime_to_nanoseconds(now, &ns);
+    return ns / 1000000000ULL;
 }
 
 static void opoios_process_worker(void *, wait_result_t)
@@ -196,21 +201,61 @@ static void opoios_sys_row(char *out, size_t size, unsigned seconds)
         snprintf(out + n, size - (size_t)n, " | %.190s", opoios_launchd_trace);
 }
 
+// OPOIOS: the report thread must keep printing whatever blocks elsewhere. On the device (2026-11-15 20:44) a report that
+// sampled pid 1 through proc_find(1) first printed nothing for 11 minutes: proc_find waits while a process is in exec. So
+// the samples that take process references (pid 1, then the process list) run in this worker every 3 s and publish their
+// last result with its uptime; the report prints that copy with its age and the step the worker is in (1: pid 1,
+// 2: process list, 0: sleeping), and itself reads only lock-free state: the Image4 row and launchd's task first seen.
+static char opoios_published_sys[640], opoios_published_pid1[160];
+static uint64_t opoios_published_at;
+static volatile uint32_t opoios_sampler_step;
+static uint32_t opoios_publish_lock;
+
+static void opoios_sampler(void *, wait_result_t)
+{
+    static char sys[640];
+    for (;;) {
+        opoios_sampler_step = 1;
+        opoios_launchd_sample();
+        opoios_sampler_step = 2;
+        const uint64_t at = opoios_uptime_seconds();
+        opoios_sys_row(sys, sizeof sys, (unsigned)at);
+        while (__atomic_exchange_n(&opoios_publish_lock, 1u, __ATOMIC_ACQUIRE)) {}
+        snprintf(opoios_published_sys, sizeof opoios_published_sys, "%s", sys);
+        snprintf(opoios_published_pid1, sizeof opoios_published_pid1, "%s", opoios_launchd_direct);
+        opoios_published_at = at;
+        __atomic_store_n(&opoios_publish_lock, 0u, __ATOMIC_RELEASE);
+        opoios_sampler_step = 0;
+        IOSleep(3000);
+    }
+}
+
 static void opoios_sys_report(void *argument, wait_result_t)
 {
     const unsigned limit = (unsigned)(uintptr_t)argument;
-    char row[640] = "", image4[360] = "";
+    static char sys[640], pid1[160], image4[360], cached[200], trace[200];
+    uint64_t at = 0;
     for (unsigned elapsed = 0; elapsed < limit;) {
         const unsigned step = limit - elapsed < 15 ? limit - elapsed : 15;
         IOSleep(step * 1000);
         elapsed += step;
-        opoios_launchd_sample();
-        opoios_sys_row(row, sizeof row, elapsed);
-        printf("%s\n", row);
         opoios_image4_row(image4, sizeof image4);
         printf("%s\n", image4);
+        opoios_launchd_cached(cached, sizeof cached, trace, sizeof trace);
+        printf("OPOIOS LD %s%s%s\n", cached, trace[0] ? " | " : "", trace);
+        if (!__atomic_exchange_n(&opoios_publish_lock, 1u, __ATOMIC_ACQUIRE)) {
+            snprintf(sys, sizeof sys, "%s", opoios_published_sys);
+            snprintf(pid1, sizeof pid1, "%s", opoios_published_pid1);
+            at = opoios_published_at;
+            __atomic_store_n(&opoios_publish_lock, 0u, __ATOMIC_RELEASE);
+        }
+        const uint64_t now = opoios_uptime_seconds();
+        printf("OPOIOS SAMPLE now %llus at %llus step %u | %s\n", (unsigned long long)now, (unsigned long long)at,
+               (unsigned)opoios_sampler_step, pid1);
+        printf("%s\n", sys);
     }
-    panic("%s\n%s", row, image4);
+    panic("%s\nOPOIOS LD %s | %s\nOPOIOS SAMPLE at %llus step %u | %s\n%s", image4, cached, trace, (unsigned long long)at,
+          (unsigned)opoios_sampler_step, pid1, sys);
 }
 
 static void opoios_sys_report_start(void)
@@ -221,6 +266,7 @@ static void opoios_sys_report_start(void)
     if (seconds > 3600) seconds = 3600;
     thread_t thread;
     if (kernel_thread_start(opoios_process_worker, nullptr, &thread) == KERN_SUCCESS) thread_deallocate(thread);
+    if (kernel_thread_start(opoios_sampler, nullptr, &thread) == KERN_SUCCESS) thread_deallocate(thread);
     if (kernel_thread_start(opoios_sys_report, (void *)(uintptr_t)seconds, &thread) == KERN_SUCCESS) {
         thread_deallocate(thread);
         printf("SourceStorage: OPOIOS system report in %u s\n", seconds);
