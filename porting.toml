@@ -1,7 +1,7 @@
 schema_version = 1
 
 [device]
-name = "aston"
+name = "xueying"
 soc = "SM8550"
 os_profile = "ios-27.0.1-24A446"
 summary = "OnePlus Ace 3 PJE110 (aston), SM8550, iPadOS 27.0.1 (24A446). CPU and persistent Data fixes are source changes awaiting device verification. Inherited sheng observations are reference-board evidence only."

@@ -1,0 +1,47 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// OnePlus Open (xueying, CPH2551, OnePlus projects 22003/22899). Hardware description for XNU's ADT; the boot image carries
+// the firmware DTB (the phone's own live DT, /chosen removed).
+// Sources: OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8550 oneplus/sm8550_b_16.0.0_oneplus_open 14c36639
+// (xueying-22003-kalama-overlay.dts, tp/xueying-oplus_tp-22003.dtsi, display xueying-22003-display-kalama-overlay.dtsi),
+// the live device tree and /proc/iomem of this phone (OPOIOS inventory 2026-11-14), derived from UniXNU-aston dts/aston.dts.
+//
+// OPOIOS safety rule: this phone is the owner's only daily phone. Storage is NEVER enabled here: the SoC include keeps the
+// UFS host controller (&ufs) and its PHY (&ufsphy) disabled, so no storage driver of the kernel (ShengUfs) has a device to
+// attach to. The root file system comes from a RAM disk. Never switch the ufs or ufsphy node to status okay on this board.
+/dts-v1/;
+/include/ "sm8550.dtsi"
+
+/ {
+    model = "OnePlus Open CPH2551";
+    compatible = "oneplus,xueying", "oneplus,cph2551", "qcom,sm8550";
+
+    // Handoff window as on the reference board: DarwinBoot owns its kernel window through UEFI AllocatePages (owned_memory_size).
+    memory@80000000 {
+        device_type = "memory";
+        reg = <0 0x80000000 0 0x80000000>;
+    };
+
+    reserved-memory {
+        #address-cells = <2>;
+        #size-cells = <2>;
+        ranges;
+        // splash_region of the live DT and "Display Reserved" of uefi xueyingPkg: the framebuffer ABL lit (after fastboot boot,
+        // the INNER panel AC052 P_1 A0002, 2440 x 2268 panel-native) and UEFI's GOP keeps scanning out.
+        splash_region: framebuffer@b8000000 {
+            label = "cont_splash_region";
+            reg = <0 0xb8000000 0 0x2b00000>;
+            no-map;
+        };
+    };
+};
+
+// SM8550 topology, same as the reference: cpu0-2 Cortex-A510 (E), cpu3-4 A715, cpu5-6 A710, cpu7 X3.
+&cpu0 { unixnu,cluster-type = "E"; };
+&cpu1 { unixnu,cluster-type = "E"; };
+&cpu2 { unixnu,cluster-type = "E"; };
+&cpu3 { unixnu,cluster-type = "P"; };
+&cpu4 { unixnu,cluster-type = "P"; };
+&cpu5 { unixnu,cluster-type = "P"; };
+&cpu6 { unixnu,cluster-type = "P"; };
+&cpu7 { unixnu,cluster-type = "P"; };
+// Stage 3 (launchd from a RAM disk): no storage, no GPU, no Wi-Fi. &ufs, &ufsphy, &gpu, &gmu and &gpu_smmu stay disabled.

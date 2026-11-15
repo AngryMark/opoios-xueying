@@ -281,7 +281,11 @@ asm.write_text(text)
 sdk = run(['xcrun', '--sdk', 'iphoneos', '--show-sdk-path'], text=True).strip()
 run(['xcrun', 'clang', '-target', TRIPLE, '-isysroot', sdk, '-c', asm, '-o', OUT / 'original-bindings.o'])
 run(['xcrun', 'clang', '-target', TRIPLE, '-isysroot', sdk, '-c', OUT / 'original-addresses.S', '-o', OUT / 'original-addresses.o'])
-llvm = Path(run(['brew', '--prefix', 'llvm'], text=True).strip()) / 'bin'
+# OPOIOS: the directory of the llvm-objcopy on PATH first (Linux has no brew; every use below is llvm-objcopy, whose Mach-O
+# --globalize-symbol needs LLVM 20 or later), then Homebrew's.
+import shutil
+llvm = (Path(shutil.which('llvm-objcopy')).parent if shutil.which('llvm-objcopy')
+        else Path(run(['brew', '--prefix', 'llvm'], text=True).strip()) / 'bin')
 late = OUT / 'NativeLegacyDisplay.late.o'
 run([llvm / 'llvm-objcopy', '--remove-section=__DATA,__mod_init_func', '--globalize-symbol=__GLOBAL__sub_I_NativeLegacyDisplay.cpp', obj, late])
 

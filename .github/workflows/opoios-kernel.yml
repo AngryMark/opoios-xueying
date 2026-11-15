@@ -1,0 +1,172 @@
+name: opoios-kernel
+
+# OPOIOS: the OnePlus Open (xueying) iOS 27 kernel (24A446 as iPhone17,2) on a macOS runner with Xcode's clang, the toolchain
+# UniXNU-aston builds the same kernel with (its .github/workflows/package.yml, which this follows). Kernel only: no payload,
+# no Data seed, no firmware, no boot image; those are made on the owner's PC. No secrets are needed: the platform seed
+# (UNIXNU_UNIQUE_CHIP_ID) belongs to the payload step.
+#
+# Safety: the phone is the owner's only daily phone. Before building, the configuration this kernel reads is checked for
+# every storage write path (scripts/opoios-check-safe-config.sh), and the board must use dts/xueying.dts, which never
+# enables the UFS controller. The artifacts contain Apple code (the kernelcache's kexts): this repository stays private,
+# artifacts expire after three days.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: opoios-kernel-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  WORK: UniXNU/out/xueying/ios-27.0.1-24A446/aston_ios27
+
+jobs:
+  kernel:
+    runs-on: macos-26
+    timeout-minutes: 180
+    env:
+      # The Xcode UniXNU-aston builds the 24A446 kernel with; pinned so a runner image update does not change the compiler.
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: UniXNU-xueying
+      - name: safety gate
+        working-directory: UniXNU-xueying
+        run: |
+          grep -q '^source = "device:dts/xueying.dts"' board.toml || { echo "::error::board.toml must use dts/xueying.dts"; exit 1; }
+          bash scripts/opoios-check-safe-config.sh board.toml dts/xueying.dts configs/aston_ios27_defconfig
+      - uses: actions/checkout@v4
+        with:
+          repository: UniXNU/UniXNU
+          # UniXNU main as of 2026-11-10, the pin of UniXNU-aston b8832d72 (its package.yml): the combination that boots on
+          # the Ace 3. unixnu-patches/ (from aston) and its component patches apply to it as they are.
+          ref: 00f47f6875749dec49bb782718dff1de28006856
+          path: UniXNU
+          submodules: false
+      - name: UniXNU submodules
+        # As aston: AppleKeyStoreState's pin 6ff4f11d may be missing from its repository; then its main 58e5461 (the pin only
+        # renamed boot arguments, and the driver reads none), recorded in the index so unixnu keeps it.
+        working-directory: UniXNU
+        run: |
+          for p in $(git config -f .gitmodules --get-regexp '^submodule\..*\.path$' | awk '{print $2}'); do
+            [ "$p" = drivers/AppleKeyStoreState ] && continue
+            git submodule update --init --recursive -- "$p"
+          done
+          if ! git submodule update --init --recursive -- drivers/AppleKeyStoreState; then
+            git -C drivers/AppleKeyStoreState fetch -q origin 58e5461ed3b751e4c91426b72d8686419abe9550
+            git -C drivers/AppleKeyStoreState checkout -q --detach 58e5461ed3b751e4c91426b72d8686419abe9550
+            git update-index --cacheinfo 160000,58e5461ed3b751e4c91426b72d8686419abe9550,drivers/AppleKeyStoreState
+            echo "::warning::AppleKeyStoreState at 58e5461 instead of the unfetchable pin"
+          fi
+          git submodule status --recursive | awk '{print $1, $2}' | head -40
+      - uses: actions/checkout@v4
+        # Only the boot-screen font (build-gop-legacy-display-27.py reads Font.h through UNIXNU_UEFI), as aston.
+        with:
+          repository: Project-Silicium/Mu-Silicium
+          ref: 6b3d90b79e191e08171bfedd3980234a7e49d340
+          path: Mu-Silicium
+          sparse-checkout: Silicon/Silicium/SiliciumPkg/Library/FrameBufferSerialPortLib
+      - name: tools
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for attempt in 1 2 3; do
+            brew install dtc llvm lld cmake mtools ninja bison pkgconf blacktop/tap/ipsw && break
+            echo "::warning::brew install failed (attempt $attempt)"; sleep 45
+          done
+          if ! command -v ipsw >/dev/null; then
+            dir="$RUNNER_TEMP/ipsw"; archive=ipsw_3.1.743_macOS_arm64_extras.tar.gz
+            gh release download v3.1.743 -R blacktop/ipsw -p "$archive" -D "$dir"
+            echo "c7da3f9fba1901a608e81d06269f4050f60a5b55ebf7418535336bb9c8810eba  $dir/$archive" | shasum -a 256 -c -
+            tar -xzf "$dir/$archive" -C "$dir"
+            echo "$dir" >> "$GITHUB_PATH"; export PATH="$dir:$PATH"
+          fi
+          {
+            echo "/opt/homebrew/opt/llvm/bin"
+            echo "/opt/homebrew/opt/lld/bin"
+            echo "/opt/homebrew/opt/bison/bin"
+          } >> "$GITHUB_PATH"
+          export PATH="/opt/homebrew/opt/llvm/bin:/opt/homebrew/opt/lld/bin:/opt/homebrew/opt/bison/bin:$PATH"
+          ok=1
+          for t in clang xcodebuild make git ninja cmake dtc fdtget fdtput compression_tool ipsw llvm-objcopy llvm-nm; do
+            command -v "$t" >/dev/null || { echo "missing tool: $t"; ok=0; }
+          done
+          [ -f Mu-Silicium/Silicon/Silicium/SiliciumPkg/Library/FrameBufferSerialPortLib/Font.h ] || { echo "missing Font.h"; ok=0; }
+          [ "$ok" = 1 ]
+          xcodebuild -version
+          echo "iphoneos SDK $(xcrun --sdk iphoneos --show-sdk-version)"
+          df -h "$GITHUB_WORKSPACE"
+      - name: git sparse mode
+        # Ath12kWifi's source fetch adds root-anchored sparse patterns, which cone mode rejects (as aston).
+        run: git config --global core.sparseCheckoutCone false
+      - name: driver checkouts
+        run: bash UniXNU-xueying/scripts/fetch-aston-drivers.sh UniXNU-xueying
+      - name: iOS 27 profile
+        # As aston: unixnu-patches/ adds ios-27.0.1-24A446 (iPhone17,2 D94AP) to the pinned checkout; component patches go to
+        # their checkouts; XnuPrelink gets the reviewed iPhone17,2 fileset pins.
+        working-directory: UniXNU
+        run: |
+          for p in ../UniXNU-xueying/unixnu-patches/*.patch; do echo "apply $p"; git apply "$p"; done
+          for d in ../UniXNU-xueying/unixnu-patches/*/; do
+            c=$(basename "$d"); path=drivers/$c
+            [ -d "$path" ] || path=kits/$c
+            [ -d "$path" ] || { echo "no component checkout for $c"; exit 1; }
+            for p in "$d"*.patch; do echo "apply $p in $path"; git -C "$path" apply "$(pwd)/$p"; done
+          done
+          cp ../UniXNU-xueying/scripts/fileset-24A446-d94ap-symbols.json kits/XnuPrelink/fixtures/
+      - uses: actions/cache@v4
+        # The IPSW components (kernelcache, device tree, trust caches, restore ramdisk; about 270 MB from Apple's CDN) and the
+        # source feeds, so a rerun does not download them again. The cache is private to this repository.
+        with:
+          path: |
+            UniXNU/out/ipsw
+            UniXNU/out/feeds
+          key: opoios-inputs-${{ hashFiles('UniXNU-xueying/unixnu.lock', 'UniXNU-xueying/feeds.toml', 'UniXNU-xueying/unixnu-patches/0001-ios-27.0.1-24A446-iphone17-2.patch') }}
+      - name: kernel
+        working-directory: UniXNU
+        env:
+          UNIXNU_DEVICE: ${{ github.workspace }}/UniXNU-xueying
+          UNIXNU_UEFI: ${{ github.workspace }}/Mu-Silicium
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          trap 'df -h . || true' EXIT
+          ./unixnu defconfig aston_ios27_defconfig -D ../UniXNU-xueying
+          ./unixnu fetch -D ../UniXNU-xueying
+          ./unixnu ipsw fetch -D ../UniXNU-xueying
+          ./unixnu build kernel -D ../UniXNU-xueying
+      - name: logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs
+          retention-days: 3
+          path: |
+            ${{ env.WORK }}/logs/*.log
+            ${{ env.WORK }}/tree/build/xnu/fileset-reference/*/*-build.log
+            ${{ env.WORK }}/tree/build/xnu/fileset-reference/*/native-stubs.c
+            ${{ env.WORK }}/tree/build/xnu/fileset-reference/*/omitted-unavailable-forced-exports.json
+      - name: prelink inputs
+        # A failed prelink can be rerun offline with emit_prelink.py (as aston).
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: prelink-inputs
+          retention-days: 3
+          include-hidden-files: true
+          path: |
+            ${{ env.WORK }}/tree/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped.noctf
+            ${{ env.WORK }}/tree/build/xnu/fileset-reference/mach.release.bcm2837.unstripped.noctf
+            ${{ env.WORK }}/kernel/.prelink-*/*.json
+      - name: kernel image
+        uses: actions/upload-artifact@v4
+        with:
+          name: xueying-ios27-kernel
+          retention-days: 3
+          if-no-files-found: error
+          path: |
+            ${{ env.WORK }}/kernel/kernel.macho
+            ${{ env.WORK }}/kernel/*.json

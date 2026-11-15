@@ -1,29 +1,19 @@
 schema_version = 2
-
-# OnePlus Ace 3 PJE110 (project 23801, OnePlus board name "aston"), SM8550-AB, 16 GiB / 512 GiB, ColorOS 15.0.0.870(CN01).
-# Derived from UniXNU-sheng 689400177f93219a38bd7cf5ae2e9f5782adc594 (Xiaomi Pad 6S Pro, the reference SM8550 board) and its
-# iPadOS 27.0.1 (24A446) chain. The iPadOS 17 chain of that board needs prelinked candidate kernels qualified on sheng hardware
-# (scripts/audit-mobile-graphics-legacy.py), which no other board can produce, so this board follows the 27 chain.
-# Branch ios27: the same board on iOS 27.0.1 (24A446) as iPhone17,2 (D94AP), the profile of unixnu-patches/ (after
-# markakash/UniXNU-ishtar, the SM8550 iOS 27 port). Stage A: CPU display, touch, keys, storage, battery and DSP; no GPU yet.
+# OnePlus Open CPH2551 (xueying, OnePlus projects 22003/22899), SM8550-AB, 16 GiB / 512 GiB, OxygenOS 16.0.1.300(EX01).
+# OPOIOS fork of MoyuZJ912/UniXNU-aston b8832d72 (OnePlus Ace 3, iOS 27.0.1 24A446 as iPhone17,2 D94AP), itself derived from
+# UniXNU-sheng. This is the owner's ONLY daily phone: every boot is `fastboot boot` from RAM, nothing is ever flashed, and no
+# storage write path may be enabled (no [userdata], no native-ufs-root, no data-persist, no log, no persistent_data; the
+# device tree never enables &ufs). Check with OPOIOS scripts/check-safe-config.sh before every boot.
+# Stage 3: XNU to launchd with the IPSW's restore ramdisk as root (RamBlock, rd=md0-ramblock), no GPU/touch/Wi-Fi/DSP yet.
 # The package keeps the reference kit name "sheng" (installed as kits/sheng) and the "sheng-*" boot argument names: the shared
 # scripts and drivers address the board kit by that name.
 [board]
-name = "aston"
+name = "xueying"
 soc = "SM8550"
-description = "OnePlus Ace 3 PJE110"
+description = "OnePlus Open CPH2551 (xueying) - OPOIOS, RAM only"
 kit = "sheng"
 soc_source = "sm8550"
 os_profile = "ios-27.0.1-24A446"
-
-# The iOS partition carved from the end of Android's userdata (dual_sys plan-32g, sda15, 32 GiB). ShengUfs is built to match the
-# GPT name "unixnu" only (drivers/ShengUfs/RootLayout.h); Android's userdata is never opened. The image file keeps the upstream
-# name userdata-root.img; it is written to unixnu, never to userdata.
-[userdata]
-partition = "unixnu"
-first_lba = 115424000
-last_lba = 123812607
-lba_bytes = 4096
 
 [kernel]
 defconfig = "aston_ios27_defconfig"
@@ -33,7 +23,10 @@ patch_series = ["arch:patches/xnu/series", "soc:patches/xnu-12377/series", "os:p
 # CPU frequency, GPU power) and links them against the original families of this fileset. fetch-sheng-dts.py and the prepare-sheng-*
 # generators still read the reference board's devicetree for the GPU inputs (the same kalama GPU and GMU nodes).
 archives = [
-  "prepare-aston-ramblock.py",
+  # OPOIOS: aston's prepare-aston-ramblock.py is left out. It stages aston's "publish after store" fix of the persistent
+  # Data store over RamBlock 60a54ce8 and refuses any other revision; UniXNU main carries RamBlock 737f6da (60a54ce8 plus
+  # "report the device as solid state" and "return the packed seed's memory after the import"). Without a store
+  # (no data-persist, no UFS in the device tree) the fix and the original publish the RAM disk the same way.
   # Before any storage step: component:ShengUfs runs build-sheng-source-storage.py without --policy-dir.
   "stage-aston-root-policies.py scripts/policies/ios-27.0.1-24A446",
   "build-corecrypto-14.py",
@@ -80,118 +73,53 @@ roots = [
 ]
 
 [firmware]
-# Not used: the Ace 3 firmware is Mu-Silicium "aston", built by Ace3-UniXNU/scripts/build-ram-probe.sh.
-config = "aston"
-dsc = "Platforms/OnePlus/astonPkg/aston.dsc"
-fd = "Build/astonPkg/{target}_CLANGPDB/FV/SILICIUM_UEFI.fd"
+# OPOIOS uefi xueyingPkg (uefi-sheng fork, branch xueying): no vendor DXEs, no UFS/SDCC/USB-MSD/UFP, framebuffer on the
+# inner panel 2440 x 2268 (ABL scans 0xB8000000 out there after fastboot boot). Verified on the phone 2026-11-15.
+config = "xueying"
+dsc = "Platforms/OnePlus/xueyingPkg/xueying.dsc"
+fd = "Build/xueyingPkg/{target}_CLANGPDB/FV/SILICIUM_UEFI.fd"
+packages = ["{uefi}", "{tree}/package", "{tree}/drivers/DarwinBoot", "{edk2}"]
 
 [payload]
-volume = "ASTONESP"
+volume = "XUEYINGESP"
 size_mib = 176
-root_policies = "{tree}/build/sheng-source-storage/root-policies.bin"
 loader = "firmware"
-title = "iOS"
+title = "OPOIOS iOS 27"
 dram_size = "0x80000000"
 skip_setup_tool = "scripts/seed-data-skip-setup.py"
 panic_screen = true
-# Second test (2026-11-08). The first boot reached SpringBoard on the CPU display path: touch worked; the UI was slow, backboardd
-# aborted and its render clients crashed in a loop, the wallpaper was missing (it comes with the GPU addon), the battery level was a
-# placeholder, and scale 2 gave 632x1390 points, narrower than any iPad. These arguments add the Adreno 740 (the phone's own ZAP image,
-# scripts/data/aston-gpu-inputs.json) with GPU frames written straight into the firmware framebuffer (sheng-fb-gpu=1; not the reference
-# board's DPU scanout, sheng-dpu-scanout, which programs its own panel), the Metal -> Vulkan addon with the wallpapers
-# (sheng-gpu-addon=1), the pack's fuel gauge (sheng-battery=2: bq28z610 on QUP2 SE0, read only) and scale 3 (421x927 points, the
-# physical size of an iPhone at 3x on this 452 ppi panel). The payload menu (.github/workflows/package.yml) also offers the same boot
-# at scale 2 and the first test's CPU display path, for comparison and as a fallback.
-# Not ported to this board yet: sheng-audio, sheng-bluetooth, sheng-usb.
+# OPOIOS stage 3: console, the CPU display path on the firmware framebuffer, keys, SMP; the root on the payload's RAM disk
+# (rd=md0-ramblock: the RamBlock disk is the root and bsd_init skips the sealed-root check, OddlyLabs/unixnu-fuxi r3-ramblock).
+# Removed from aston: native-source-storage, native-ufs-root (UFS root), sheng-log (log writer on userdata), sheng-data-persist
+# (Data store on userdata), sheng-aks, touch (Synaptics on aston; Goodix GT9966/GT9916 here), GPU, battery, ADSP, backlight
+# (AA551 panel on aston), Wi-Fi, cpufreq.
 kernel_args = [
   "-v", "serial=3", "debug=0x14e", "kt_fixed_zones=120", "-no_slto_panic", "use_contiguous_hint=0",
-  "native-source-storage=1", "native-ufs-root=1",
+  "rd=md0-ramblock",
   "offline-mobile-graphics-load=1", "offline-mobile-graphics-client=1", "offline-legacy-register=1", "offline-legacy-gop=1",
   "offline-legacy-unit-scale=3", "offline-legacy-pm=1", "offline-legacy-validate=1", "offline-legacy-transfer=1",
-  "offline-legacy-cpu-present=1", "offline-legacy-phase=4", "offline-key-events=1",
-  "sheng-aks=1", "offline-hid-input=1", "offline-hid-home=1",
-  "sheng-touch=4", "sheng-touch-hid=1", "sheng-buttons=1", "sheng-log=1",
-  "smp=1", "armcpu-spi-ipi=1", "armcpu-self-ipi=1", "armcpu-edge=1", "sheng-data-persist=2", "sheng-cpufreq=4",
-  # Brief touch boost; continuous display activity must not impose a CPU frequency floor.
-  "sheng-cpufreq-boost-ms=80", "sheng-cpufreq-frame-ms=0",
-  # GPU (stage B), as on iPadOS b5bb234: the A740 powered with its GMU and SQE firmware and this phone's ZAP (sheng-gpu-power=9,
-  # sheng-gpu-metal=1, sheng-gpu-dcvs=1: GpuPowerProbe), each frame written by the GPU into the firmware framebuffer (sheng-fb-gpu=1
-  # for LegacyDisplayProbe, fb-gpu=1 for GopFramebuffer's presenter), 8-bit BGRA in the render server (fb-bgra=1, the Metal plugin)
-  # and the Metal -> Vulkan addon mounted (gpu-addon=1, zzy-native-gpu-addon-mount). The plugin writes QuartzCore's options only in a
-  # shared cache it knows (unixnu-patches/AdrenoMetal: the iPhone17,2 cache 1892D244 as well as the iPad's).
-  "sheng-gpu-power=9", "sheng-gpu-metal=1", "sheng-fb-gpu=1", "fb-gpu=1", "fb-bgra=1", "sheng-gpu-dcvs=1", "gpu-addon=1",
-  # UniXNU 47ec6a5 dropped the sheng- prefix from the arguments its drivers and patches read: smp (ArmCpu), vsync and vsync-fixed
-  # (GopFramebuffer), no-lc (zzyc-owner-skip-launch-constraints), data-reset (RamBlock). This board's own code keeps sheng-*.
-  # The battery values come from the pack's fuel gauge (sheng-battery=2); charging itself is the battery manager in the audio DSP, so
-  # the DSP is started (sheng-adsp=2, firmware read in place from modem_a, adspslpi 0x9ea00000 + 0x4880000 on this board).
-  "sheng-battery=2", "sheng-adsp=2",
-  # Panel brightness: DCS 0x51 to the AA551 panel over DSI0 (AstonPanel.cpp) for the iOS brightness service (AppleARMBacklight.cpp).
-  "sheng-backlight=2",
-  # Wi-Fi: the reference board's mainline ath12k runtime (Ath12kWifi, WifiProbe/WifiNet, wpa_supplicant) on this phone's WCN7850
-  # (PCIe0, same pins and rails); firmware and this phone's board data from the root image object "Wifi" (package/WifiFirmware.c,
-  # scripts/make-aston-wifi-object.py), so none of it is in the build. The kernel carries the stack only with ASTON_WIFI=1.
-  "sheng-wifi=5",
-  # No sheng-staged-apps: on 27 the deletable system apps come through the staged apps union, and a copy in Data makes the
-  # first-boot migration install them as system app upgrades, which installd refuses ("System app upgrade is missing upgrade
-  # entitlement"; iPadOS boot 6, DMLastMigrationResults success = false).
+  "offline-legacy-cpu-present=1", "offline-legacy-phase=4", "offline-key-events=1", "sheng-buttons=1",
+  "smp=1", "armcpu-spi-ipi=1", "armcpu-self-ipi=1",
   "no-lc=1", "vsync=60", "vsync-fixed=1", "sheng-disable-watchdogd=1", "sheng-lite=1",
 ]
-
-[payload.runtime]
-tool = "scripts/build-boot-runtime.py"
-target = "ios27"
-build = "24A446"
-# The Data volume inside unixnu after the OS root windows and the log. iOS: the root image is about 16.56 GB (OS 10223616000 and
-# SystemOS 6023020544 bytes, the two .vroot tables and the payload), the store window of 14 GiB plus its bitmap starts at block
-# 4456335 of unixnu (8388608 blocks, 1 GiB log reserve at the end), about 1.7 GB above the root image.
-data_gib = 14
-skip_setup = true
-trust_components = ["StaticTrustCache", "Cryptex1,SystemTrustCache", "Cryptex1,AppTrustCache"]
-# The iPadOS 27 wallpaper overlays name iPad paths; iOS has none yet.
-wallpapers = []
-# The Metal plugin (Turnip and metal2vulkan) in the GPU addon, without wallpapers.
-gpu_addon = true
-# Owner overlays of sealed system files, made from the OS image into the GPU addon (unixnu-patches/0003): configd's InterfaceNamer
-# with short wait timeouts, which the kernel mounts over its bundle (patches/xnu-12377/aston-interface-namer-overlay.patch).
-overlay_tool = "scripts/aston-runtime-overlays.py"
-# The Wi-Fi supplicant and its launchd job in the GPU addon, with the merged launchd cache (as the reference board). The WCN7850
-# firmware is not staged here: the kernel reads it from the root image object "Wifi".
-wifi_tool = "scripts/build-wifi-userspace.py"
-wifi_target = "ios27"
-wifi_launchd_cache = true
-wifi_bin_prefix = "wifi-bin"
-# launchd loads spaceattributiond (Settings > iPhone Storage sizes) only where the device tree has /filesystems e-apfs. That property
-# also turns on Enhanced APFS in the APFS kext (new volume format, volume fixups at mount, metadata crypto), so the board does not
-# set it; the merged cache drops the requirement for this job instead (unixnu-patches/0004). Boot 9: "Service cannot be loaded on
-# this hardware", every lookup of com.apple.spaceattributiond failed and Settings read Zero KB.
-launchd_job_device_tree = ["com.apple.spaceattributiond"]
-
-[payload.runtime.launchd_job_environment."com.apple.iconservices.iconservicesagent"]
-FORCE_SOFTWARE_RENDERER = "0"
-CI_ENABLE_METAL_GPU = "0"
-
-[payload.install]
-title = "Install and boot"
-confirm = "ERASE all iOS user data and install again?"
-confirm_titles = ["Erase Data, skip Hello, boot", "Erase Data, show Hello, boot"]
-# RamBlock reads data-reset (UniXNU 47ec6a5); BootWatchdogPolicy.c reads it too.
-confirm_args = ["data-reset=1", "data-reset=2"]
 
 [payload.adt]
 chip_id = "8142"
 owned_memory_size = "0x130000000"
 packed_data_ramdisk = true
-persistent_data = true
+# OPOIOS root: the restore ramdisk 043-69915-784.dmg (RestoreRamDisk of 24A446) as the packed RAM disk, with the restore
+# trust cache (043-69915-784.dmg.trustcache). Its single APFS volume "ramdisk" (raw APFS inside IM4P rdsk, 232.0 MiB,
+# 184.0 MiB nonzero), read with OPOIOS tools/restore_ramdisk_info.py:
+root_match_volume_uuid = "A21BAD53-1478-4E76-8EB4-19970D00EE06"
 unique_chip_id = "required"
 
 [bootimg]
-# The Mu-Silicium aston DTB that Ace3-UniXNU packs (out/phone/firmware.dtb, /chosen initrd keys removed). Mu-Silicium aston
-# reserves the same splash range as sheng: "Display Reserved" 0xB8000000 + 0x2B00000 (astonPkg MemoryMapLib.c).
-dtb = "../Ace3-UniXNU/out/phone/firmware.dtb"
+# The phone's own live device tree (OPOIOS inventory 2026-11-14), /chosen removed: no serial numbers.
+dtb = "../uefi-sheng/Resources/DTBs/xueying.dtb"
 dtb_node = [{ path = "/reserved-memory/splash_region", props = [{ name = "label", type = "s", value = "cont_splash_region" }, { name = "reg", type = "x", value = ["0x0", "0xb8000000", "0x0", "0x2b00000"] }] }]
 
 [device_tree]
-source = "device:dts/aston.dts"
+source = "device:dts/xueying.dts"
 include_dirs = ["soc:dts"]
 
 [components]

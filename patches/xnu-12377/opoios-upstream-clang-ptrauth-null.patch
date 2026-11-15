@@ -1,0 +1,25 @@
+diff --git a/libkern/os/base.h b/libkern/os/base.h
+--- a/libkern/os/base.h
++++ b/libkern/os/base.h
+@@ -355,7 +355,21 @@
+ #if __has_feature(ptrauth_calls)
+ #include <ptrauth.h>
+ #define OS_PTRAUTH_SIGNED_PTR(type) __ptrauth(ptrauth_key_process_independent_data, 1, ptrauth_string_discriminator(type))
++#if defined(__apple_build_version__)
+ #define OS_PTRAUTH_SIGNED_PTR_AUTH_NULL(type) __ptrauth(ptrauth_key_process_independent_data, 1, ptrauth_string_discriminator(type), "authenticates-null-values")
++#else
++/*
++ * OPOIOS: the fourth __ptrauth argument ("authenticates-null-values") exists only in Apple's clang (Xcode);
++ * upstream clang (UniXNU's Linux toolchain) and swiftlang/llvm-project take at most three. Here the field is
++ * signed with the same key and discriminator, but a null value is stored as 0 where Apple's clang signs it.
++ * The kexts that authenticate such a field themselves (Sandbox and AMFI, ucred.cr_label; OPOIOS
++ * tools/scan_ptrauth_disc.py on the 24A446 kernelcache) read credentials from the read-only zone, which
++ * kauth_cred_alloc() signs by hand with ptrauth_sign_unauthenticated(), a null label included: the same bits
++ * as with Apple's clang. The other fields (ipc_port, twe_pdrequest, ipc_service_port_label) are the kernel's own.
++ * Prior art: OneiOS kernel/device/patches/xnu-12377/oneios-stock-clang-ptrauth.patch.
++ */
++#define OS_PTRAUTH_SIGNED_PTR_AUTH_NULL(type) __ptrauth(ptrauth_key_process_independent_data, 1, ptrauth_string_discriminator(type))
++#endif
+ #define OS_PTRAUTH_DISCRIMINATOR(str) ptrauth_string_discriminator(str)
+ #define __ptrauth_only
+ #else //  __has_feature(ptrauth_calls)

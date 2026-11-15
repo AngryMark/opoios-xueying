@@ -1,11 +1,11 @@
 {
-  "comment": "OnePlus Ace 3 (PJE110) GPU firmware the kernel embeds in place of the reference board's. The ZAP shader is signed by the phone maker and authenticated by TrustZone (PAS), so only the phone's own image runs. Fill bytes and sha256 from scripts/pull-aston-gpu-firmware.sh; the file itself stays under .cache/firmware/aston-gpu and never enters the repository. With sha256 null the kernel carries an empty ZAP image and the GPU stops at its ZAP step.",
+  "comment": "OnePlus Ace 3 (PJE110) GPU firmware the kernel embeds in place of the reference board's. The ZAP shader is signed by the phone maker and authenticated by TrustZone (PAS), so only the phone's own image runs. Fill bytes and sha256 from scripts/pull-aston-gpu-firmware.sh; the file itself stays under .cache/firmware/aston-gpu and never enters the repository. With sha256 null the kernel carries an empty ZAP image and the GPU stops at its ZAP step. OPOIOS (xueying): sha256 null on purpose. The Ace 3's image is not this phone's, and stage 3 runs without the GPU (the device tree keeps &gpu disabled). The OnePlus Open's own a740_zap is read from its vendor firmware at stage 5 (read-only, from the OPOIOS backup or the running Android). aston's value was bytes 12088, sha256 39dad2d75b234c2664a3d8435d32debc50c933825056e6badf40eb409e8a8bbb.",
   "firmware": {
     "files": {
       "qcom/sm8550/aston/a740_zap.mbn": {
-        "bytes": 12088,
-        "sha256": "39dad2d75b234c2664a3d8435d32debc50c933825056e6badf40eb409e8a8bbb",
-        "source": "PJE110 ColorOS 15.0.0.870(CN01) vendor_b /firmware/a740_zap.mbn (read from the erofs image dumped in TWRP, 2026-11-08); its three segments equal a740_zap.mdt + .b00-.b02 joined (they differ only in padding)"
+        "bytes": null,
+        "sha256": null,
+        "source": "OPOIOS: not pinned for xueying yet (stage 5). aston's was PJE110 ColorOS 15.0.0.870(CN01) vendor_b /firmware/a740_zap.mbn"
       }
     }
   }
