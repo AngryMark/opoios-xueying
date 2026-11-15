@@ -1207,6 +1207,13 @@
       "original_sha256": "7d002b618257b2c78c8f2305600363fd5c52d5bf021ae2e82313c7d19a04ebb4",
       "native_symbol": "__ZN14IOPMrootDomain9isLPWModeEv",
       "evidence": "Kext pointers name this function (IOAccessoryManager); at the same entry, segment and offset the iPad17,3 38e6d9fa collection points at the function XnuPrelink pairs with __ZN14IOPMrootDomain9isLPWModeEv (reviewed). Kexts are the same binaries in both collections, so the slot is the same import. Size and sha256 from the iPhone17,2 kernel's function starts. Derived by UniXNU-aston scripts/derive-fileset-pins.py."
+    },
+    {
+      "original": "0xfffffff00b432308",
+      "original_size": 664,
+      "original_sha256": "ff6019f657439cb0e360d109cec02357535b11cbf1fbd7cf8a4518f462d21a3d",
+      "native_symbol": "_SecureDTLookupEntry",
+      "evidence": "Returns kError until DTInitialized, then walks the path components of pathName from searchPoint or DTRootNode. Source: pexpert/gen/device_tree.c:452. Paired by UniXNU XnuPrelink in OPOIOS CI run 43743370810 (native kernel built with Xcode 26.6) through its callers' device-tree data (data-users). A native kernel built with the Linux clang-24 toolchain keeps about 19000 fewer local symbols (no .cold splits or OUTLINED_FUNCTION copies), the data pairing then misses this function, and AppleMobileFileIntegrity, sandbox, Image4, AppleImage4 and AppleARMWatchdogTimer would reach the unmapped stub. Size and digest computed with fileset_match's own function bounds on kernelcache fa07057b. Added by OPOIOS 2026-11-15."
     }
   ],
   "data": [
@@ -1348,6 +1355,11 @@
       "site": "0xfffffff0080c85d0",
       "native_symbol": "_unixnu_kernel_stack_shift",
       "evidence": "AppleMobileFileIntegrity's GOT slot for PAGE_SHIFT_CONST. Its only reader is the CoreEntitlements DER iterator's stack check (sp & ((1 << *slot) - 1) < 0x80 returns error 2), which assumes the stack base is aligned to 1 << shift, as on 16 KiB-page Apple kernels where the two lower guard pages are 32 KiB. On the native 4 KiB kernel the stack starts 8 KiB into a 32 KiB-aligned allocation, so the page shift (and 14) give false out-of-stack errors at fixed call depths (OSEntitlements copyDictionary failed with 14 on the exec path). Bound to unixnu_kernel_stack_shift, the allocation alignment shift (15), for which sp & mask stays at least 8 KiB inside any stack. The other ~70 components keep PAGE_SHIFT_CONST for page arithmetic. iPhone17,2: the only AppleMobileFileIntegrity pointer to PAGE_SHIFT_CONST (0xfffffff007dec770), at __DATA_CONST+0x6dc0 as on iPad17,3 (0xfffffe0008136458); kc-port rejected the iPad slot only because its target address differs. Reproduced on ishtar: \"AMFI: failed to create OSDictionary copy: 14\" @OSEntitlements.cpp:863 on launchd's first spawn (2026-10-30)."
+    },
+    {
+      "site": "0xfffffff0083ae8c8",
+      "native_symbol": "_opoios_image4_monitor_absent",
+      "evidence": "com.apple.security.Image4's GOT slot for the kernel function at 0xfffffff00b11beac, which builds a TXM call (selector 52, failure_fatal, three input arguments) and returns an errno from the monitor. The native kernel has no TXM and no such function, so the slot went to unixnu_fileset_unmapped. Its only caller is Image4::start (0xfffffff00a8698fc; call at 0xfffffff00a869a44 through the stub at 0xfffffff00a87a9a8), once per magazine slot whose state was read, with (slot index, slot buffer, buffer word 6). The result is ignored and the loop goes on; start then uncorks AppleImage4's userspace (export 0xfffffff008fe301c sets the flag the sysctl \"activate\" polls) and registers the service. With no monitor there is nothing to tell: the stand-in (package/Image4MonitorAbsent.c) counts the call and returns ENOTSUP. Image4's three other unpaired kernel targets (0xfffffff00b11bf24, TXM selector 53; 0xfffffff00b11bf90; 0xfffffff00b11bfb0) are reached only from other Image4 paths and stay unmapped."
     }
   ]
 }

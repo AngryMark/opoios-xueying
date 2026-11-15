@@ -59,7 +59,11 @@ archives = [
 [kernel.prelink]
 # The profile's roots plus the USB device and host stacks (the reference board's list; the SoC's USB controller is the same).
 # The iPhone17,2 fileset has no com.apple.iokit.IOHIDEventDriver bundle (the class ships in IOHIDFamily).
+# com.apple.security.Image4 is a root for its personality (IOPlatformDevice "defaults"): as a mere dependency of AppleImage4 its
+# personality was dropped, Image4::start never ran, and AppleImage4's "userspace cork" (del2 state +64, byte +16) stayed shut,
+# so launchd's sysctl "activate" polled it with IOSleep(1) forever (phone run 2026-11-15 19:11 UTC). Same as the uke port.
 roots = [
+  "com.apple.security.Image4",
   "com.apple.AppleFSCompression.AppleFSCompressionTypeZlib", "com.apple.driver.AppleARMPlatform", "com.apple.driver.AppleARMWatchdogTimer",
   "com.apple.driver.AppleAudioClockLibs", "com.apple.driver.AppleEffaceableStorage", "com.apple.driver.AppleIISController",
   "com.apple.driver.AppleM2ScalerCSCDriver", "com.apple.driver.AppleMobileFileIntegrity", "com.apple.driver.ApplePMGR",

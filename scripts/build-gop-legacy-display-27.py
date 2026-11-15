@@ -545,6 +545,9 @@ if not WITH_WIFI:
     # The stand-ins the kernel link needs for the display and Bluetooth probes' references to the WiFi stack.
     compile_c(KITS / 'WifiAbsent.c', board_dir / 'WifiAbsent.o')
     board_objects.append(board_dir / 'WifiAbsent.o')
+# OPOIOS: the stand-in for the one TXM call Image4::start makes per magazine slot (bound to Image4's GOT slot by a reviewed site).
+compile_c(KITS / 'Image4MonitorAbsent.c', board_dir / 'Image4MonitorAbsent.o')
+board_objects.append(board_dir / 'Image4MonitorAbsent.o')
 # The audio DSP's firmware file reader goes through the VFS: BSD flags.
 compile_c(KITS / 'AdspFirmware.c', board_dir / 'AdspFirmware.o', 'bsd/DEVELOPMENT/kern_exec.o.json')
 board_objects.append(board_dir / 'AdspFirmware.o')
