@@ -97,6 +97,20 @@ void vfs_name(struct mount *, char *);
 int vnode_put(struct vnode *);
 extern dev_t rootdev;
 extern volatile uint64_t native_ram_block_reads, native_ram_block_writes, native_ram_block_failures;
+// BootProcessProbe.c (built into this kernel for iOS 27): its capture walks the processes it knows (launchd first) and
+// samples each one's first thread: state flags/priority, wait event (W), continuation (C), user PC (U), shared region
+// slide. The capture may wait in proc_iterate, so it runs in its own worker; the report takes the published copy.
+void boot_process_capture(void);
+void boot_process_snapshot(void);
+extern char boot_process_rows[10][120];
+}
+
+static void opoios_process_worker(void *, wait_result_t)
+{
+    for (;;) {
+        boot_process_capture();
+        IOSleep(3000);
+    }
 }
 
 static void opoios_sys_row(char *out, size_t size, unsigned seconds)
@@ -122,7 +136,11 @@ static void opoios_sys_row(char *out, size_t size, unsigned seconds)
         }
         proc_rele(p);
     }
-    if (n > 0 && (size_t)n + 12 < size) snprintf(out + n, size - (size_t)n, " | n%u", found);
+    if (n > 0 && (size_t)n + 12 < size) n += snprintf(out + n, size - (size_t)n, " | n%u", found);
+    // launchd's first thread (W and C are kernel addresses: symbolize with the kernel's symbol table, slide shown).
+    boot_process_snapshot();
+    if (n > 0 && (size_t)n + 40 < size)
+        snprintf(out + n, size - (size_t)n, " | ks%lx %.110s", (unsigned long)vm_kernel_slide, boot_process_rows[0]);
 }
 
 static void opoios_sys_report(void *argument, wait_result_t)
@@ -146,6 +164,7 @@ static void opoios_sys_report_start(void)
     if (seconds < 15) seconds = 15;
     if (seconds > 3600) seconds = 3600;
     thread_t thread;
+    if (kernel_thread_start(opoios_process_worker, nullptr, &thread) == KERN_SUCCESS) thread_deallocate(thread);
     if (kernel_thread_start(opoios_sys_report, (void *)(uintptr_t)seconds, &thread) == KERN_SUCCESS) {
         thread_deallocate(thread);
         printf("SourceStorage: OPOIOS system report in %u s\n", seconds);
