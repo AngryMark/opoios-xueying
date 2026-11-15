@@ -48,6 +48,10 @@ archives = [
   "stage-aston-accelerator-abi.py",
   "build-adreno740-accelerator.py",
   "component:AppleKeyStoreState",
+  # OPOIOS: UniXNU requires an archive entry for every selected kernel-stage component. This one only compiles NativeAES for
+  # the iPadOS 17 layout into build/software-aes (not linked: XNU_NATIVE_AES is off); the linked NativeAES is the one
+  # build-gop-legacy-display-27.py compiles against software-aes-24A446-d94ap.json (as UniXNU-sheng for macOS 27.3).
+  "component:SoftwareAES",
   "build-gop-legacy-display-27.py",
   "build-fileset-release-reference.py --tree . --lto",
 ]
