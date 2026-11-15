@@ -702,6 +702,68 @@ run([llvm / 'llvm-objcopy', '--remove-section=__DATA,__mod_init_func', '--global
      USB_OUT / 'QcomDwc3.o', usb_late])
 input_objects += [usb_late, USB_OUT / 'usb-bindings.o', USB_OUT / 'usb-addresses.o', USB_OUT / 'UsbProbe.o']
 print(f'USB: {len(usb_bindings)} original bindings, {usb_vt} and {xhci_vt} match the original diversities')
+# OPOIOS: the software AES-CBC provider (UniXNU drivers/SoftwareAES, NativeAES.cpp), an IOAESAccelerator of the original
+# IOCryptoAcceleratorFamily, as UniXNU-sheng builds it for macOS 27.3. AppleImage4's start waits for an IOAESAccelerator service
+# without a limit (kmod_expert_finalize), holding its expert lock, and every sysctl it serves waits behind that lock: on the
+# device (2026-11-15) launchd stayed in __sysctl -> AppleImage4 -> lck_mtx_gate_wait. The SoC has no Apple AES engine. NativeAES's
+# vtable must be the collection's slot for slot: software-aes-24A446<suffix>.json, derived from this kernelcache by OPOIOS
+# tools/derive_aes_fixture.py (vtable found by the family's diversities, IOService part checked against usb-xdci's). Without a fixture
+# for the selected collection (the iPad17,3 profile) the step is left out and the archive is as before.
+AES_PATH = Path(__file__).resolve().with_name(f'software-aes-24A446{FIXTURE_SUFFIX}.json')
+aes_sources = []
+if AES_PATH.is_file():
+    AES_PATH, aes_abi = fixture('software-aes')
+    AES_OUT = board_dir / 'software-aes'
+    AES_OUT.mkdir(parents=True, exist_ok=True)
+    require(int(aes_abi['instance_size'], 16) == 0x120, 'IOAESAccelerator instance size of OriginalAESABI.h')
+    AES_BASE = aes_abi['base_slots']
+    aes_source = ROOT / 'drivers/SoftwareAES/NativeAES.cpp'
+    compile_cpp(aes_source, AES_OUT / 'NativeAES.o', ('-DNATIVE_AES_DARWIN26=1',))
+    aes_raw = (AES_OUT / 'NativeAES.o').read_bytes()
+    aes_found = object_symbols(aes_raw)
+    aes_slots = [(int(t, 16), int(d, 16)) for t, d in aes_abi['slots']]
+    aes_pure = int(aes_abi['pure_target'], 16)
+    aes_bindings = {n: int(v, 16) + slide for n, v in aes_abi['bindings'].items()}
+    aes_vt = '__ZTV9NativeAES'
+    aes_family = ('19IOCryptoAccelerator', '16IOAESAccelerator')
+    aes_entries = object_vtable(aes_raw, aes_found, aes_vt, len(aes_slots) + 1)
+    require(all(aes_entries[:len(aes_slots)]) and not aes_entries[len(aes_slots)], f'{aes_vt}: exactly the {len(aes_slots)} IOAESAccelerator entries')
+    aes_own = ('__ZN9NativeAES', '__ZNK9NativeAES')
+    for i, (name, word) in enumerate(aes_entries[:len(aes_slots)]):
+        require(word >> 63 and word >> 48 & 1 and word >> 49 & 3 == 0 and (word >> 32) & 0xffff == aes_slots[i][1],
+                f'{aes_vt} slot {i} ({name}) signed with the original diversity {aes_slots[i][1]:#x}')
+        if name.startswith(aes_own):
+            continue
+        if any(c in name for c in aes_family):
+            require(aes_slots[i][0] != aes_pure, f'{aes_vt} slot {i}: the abstract original slot is implemented')
+            require(aes_bindings.setdefault(name, aes_slots[i][0] + slide) == aes_slots[i][0] + slide,
+                    f'{aes_vt} slot {i} ({name}) is the original entry')
+        else:
+            require(i < AES_BASE, f'{aes_vt} slot {i} ({name}) is a kernel method within the IOService slots')
+    aes_used = {n for n, _, k in aes_found if k == 1 and any(c in n for c in aes_family)}
+    require(not (aes_used - set(aes_bindings)), f'AES imports bound to the collection: {sorted(aes_used - set(aes_bindings))}')
+    aes_used |= {e[0] for e in aes_entries[:len(aes_slots)] if not e[0].startswith(aes_own) and any(c in e[0] for c in aes_family)}
+    aes_text, aes_addresses = '.text\n.p2align 2\n', ''
+    for name in sorted(aes_used):
+        va = aes_bindings[name]
+        if name.endswith('10gMetaClassE') or name.startswith('__ZTV'):
+            aes_addresses += f'.globl {name}\n.set {name}, {va:#x}\n'
+        else:
+            aes_addresses += f'.globl {name}.original\n.set {name}.original, {va:#x}\n'
+            aes_text += f'.globl {name}\n{name}:\n bti c\n b {name}.original\n'
+    (AES_OUT / 'aes-bindings.S').write_text(aes_text)
+    (AES_OUT / 'aes-addresses.S').write_text(aes_addresses)
+    for stem in ('aes-bindings', 'aes-addresses'):
+        run(['xcrun', 'clang', '-target', TRIPLE, '-isysroot', sdk, '-c', AES_OUT / (stem + '.S'), '-o', AES_OUT / (stem + '.o')])
+    aes_late = AES_OUT / 'NativeAES.late.o'
+    run([llvm / 'llvm-objcopy', '--remove-section=__DATA,__mod_init_func', '--globalize-symbol=__GLOBAL__sub_I_NativeAES.cpp',
+         AES_OUT / 'NativeAES.o', aes_late])
+    compile_cpp(KITS / 'SoftwareAesProbe.cpp', AES_OUT / 'SoftwareAesProbe.o', ())
+    input_objects += [aes_late, AES_OUT / 'aes-bindings.o', AES_OUT / 'aes-addresses.o', AES_OUT / 'SoftwareAesProbe.o']
+    aes_sources = [aes_source, ROOT / 'drivers/SoftwareAES/OriginalAESABI.h', KITS / 'SoftwareAesProbe.cpp', AES_PATH]
+    print(f'AES: {len(aes_used)} original bindings, {aes_vt} matches the original {len(aes_slots)} diversities')
+else:
+    print(f'AES: no {AES_PATH.name}; the software IOAESAccelerator is left out')
 print(f'Board drivers: {len(board_objects)} objects')
 archive = OUT / 'libNativeLegacyDisplay.late.a'
 archive.unlink(missing_ok=True)
@@ -720,6 +782,7 @@ for directory in ('include', 'src', 'shim', 'out/linux'):
 sources += [ROOT / 'kits/Sm8550Platform' / name for name in ('Sm8550GeniUart.h', 'Sm8550QupDma.h')]
 sources += [KITS / name for name in ('SmmuBypass.h', 'AppsSmmuLock.h', 'UsbProbe.cpp')]
 sources += [USB / 'QcomDwc3.cpp', USB / 'QcomEusb2Phy.h', USB / 'QcomQmpUsb3.h', USB / 'QcomUcsi.h', USB_XDCI_PATH, USB_XHCI_PATH]
+sources += aes_sources
 
 
 def source_name(path):

@@ -514,7 +514,12 @@ extern "C" void aston_halt_restart_install(void);
 extern "C" void aston_display_window_probe(void);
 extern "C" void aston_storage_traits_install(void);
 extern "C" void aston_dpu_survey_probe(void);
+// OPOIOS: the software IOAESAccelerator (SoftwareAesProbe.cpp, built only with a software-aes fixture of this collection).
+extern "C" void sheng_software_aes_probe(void) __attribute__((weak_import));
 void native_legacy_display_late_probe(void) {
+    // OPOIOS, first: AppleImage4's start already waits for an IOAESAccelerator without a limit, holding its expert lock, and
+    // every sysctl it serves waits behind it (device 2026-11-15: launchd stuck in __sysctl -> AppleImage4 -> lck_mtx_gate_wait).
+    if (sheng_software_aes_probe) sheng_software_aes_probe();
     aston_display_window_probe();  // aston-display=1: black panel borders around iOS's window (AstonDisplayWindow.cpp)
     aston_boot_screen_probe();  // first: the boot screen takes the framebuffer until iOS draws (AstonBootScreen.cpp)
     aston_halt_restart_install();  // restart and power off through PSCI (AstonHaltRestart.c)
