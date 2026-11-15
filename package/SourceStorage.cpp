@@ -80,11 +80,55 @@ static void start_data_disk(IOService *provider)
     printf("SourceStorage: Data disk started\n");
 }
 
+// OPOIOS: the loader's RAM disk as the only storage (stage 3 RAM root, rd=md0-ramblock). With opoios-ram-root=1 and
+// the source-storage argument off, only the source IOBlockStorageDevice and NativeRamBlock are registered and the RAM
+// disk is started on the platform root. NativeUfs is never registered, created or started, so nothing reaches the
+// UFS controller; the root policies (they describe a UFS root) are not loaded and no log writer runs. NativeRamBlock
+// opens the UFS store only with sheng-data-persist (storeMode), which this board never passes.
+static void opoios_ram_root_start(void)
+{
+    unsigned enabled = 0;
+    if (!PE_parse_boot_argn("opoios-ram-root", &enabled, sizeof(enabled)) || enabled != 1 || attempted)
+        return;
+    attempted = true;
+    OSReturn status = OSKextLoadKextWithIdentifier("com.apple.iokit.IOStorageFamily");
+    if (status != kOSReturnSuccess)
+        panic("SourceStorage: OPOIOS RAM root: IOStorageFamily load failed %x", status);
+    const OSSymbol *name = OSSymbol::withCString("IOBlockStorageDevice");
+    storageParent = name ? OSMetaClass::getMetaClassWithName(name) : nullptr;
+    if (name) name->release();
+    if (!storageParent || storageParent->getClassSize() != sizeof(IOBlockStorageDevice))
+        panic("SourceStorage: OPOIOS RAM root: original base layout %u differs from source %lu",
+              storageParent ? storageParent->getClassSize() : 0, sizeof(IOBlockStorageDevice));
+    status = OSKextLoadKextWithIdentifier("com.apple.filesystems.apfs");
+    if (status != kOSReturnSuccess)
+        panic("SourceStorage: OPOIOS RAM root: APFS load failed %x", status);
+    void *handle = OSMetaClass::preModLoad(g_kernel_kmod_info.name);
+    if (!handle) panic("SourceStorage: OPOIOS RAM root: cannot begin class registration");
+    source_storage_base_init();
+    source_storage_ram_init();
+    status = OSMetaClass::postModLoad(handle);
+    if (status != kOSReturnSuccess)
+        panic("SourceStorage: OPOIOS RAM root: class registration failed %x", status);
+
+    OSDictionary *matching = IOService::serviceMatching("IOPlatformExpertDevice");
+    IOService *provider = matching ? IOService::waitForMatchingService(matching, 5000000000ULL) : nullptr;
+    if (!provider) panic("SourceStorage: OPOIOS RAM root: platform root unavailable");
+    IORegistryEntry *map = IORegistryEntry::fromPath("/chosen/memory-map", gIODTPlane);
+    const bool seed = map && (map->getProperty("PackedRAMDisk") || map->getProperty("RAMDisk"));
+    OSSafeReleaseNULL(map);
+    if (!seed) panic("SourceStorage: OPOIOS RAM root: the loader handed over no RAM disk");
+    start_data_disk(provider);
+    printf("SourceStorage: OPOIOS RAM root started, no UFS\n");
+}
+
 extern "C" void native_source_storage_start(void)
 {
     unsigned enabled = 0;
-    if (!PE_parse_boot_argn("native-source-storage", &enabled, sizeof(enabled)) || enabled != 1 || attempted)
+    if (!PE_parse_boot_argn("native-source-storage", &enabled, sizeof(enabled)) || enabled != 1 || attempted) {
+        opoios_ram_root_start();
         return;
+    }
     attempted = true;
     OSReturn status = OSKextLoadKextWithIdentifier("com.apple.iokit.IOStorageFamily");
     if (status != kOSReturnSuccess)

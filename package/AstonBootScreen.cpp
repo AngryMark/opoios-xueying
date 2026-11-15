@@ -157,7 +157,7 @@ void run(void *, wait_result_t) {
         drawBar(step);
         if (now != lastSecond) {
             lastSecond = now;
-            bp_line(gDisplay, 1, "  UniXNU  OnePlus Ace 3", kTitle);
+            bp_line(gDisplay, 1, "  UniXNU  OnePlus Open", kTitle);  // OPOIOS: this board
             snprintf(row, sizeof row, "  Booting   %u:%02u", now / 60, now % 60);
             bp_line(gDisplay, 2, row, kTitle);
             snprintf(row, sizeof row, "  %s", stage());
