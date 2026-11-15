@@ -103,6 +103,8 @@ extern volatile uint64_t native_ram_block_reads, native_ram_block_writes, native
 void boot_process_capture(void);
 void boot_process_snapshot(void);
 extern char boot_process_rows[10][120];
+// The same capture's OPOIOS row for a waiting launchd: system call (x16, x0) and kernel return addresses (low 36 bits).
+extern char opoios_launchd_trace[200];
 }
 
 static void opoios_process_worker(void *, wait_result_t)
@@ -140,7 +142,9 @@ static void opoios_sys_row(char *out, size_t size, unsigned seconds)
     // launchd's first thread (W and C are kernel addresses: symbolize with the kernel's symbol table, slide shown).
     boot_process_snapshot();
     if (n > 0 && (size_t)n + 40 < size)
-        snprintf(out + n, size - (size_t)n, " | ks%lx %.110s", (unsigned long)vm_kernel_slide, boot_process_rows[0]);
+        n += snprintf(out + n, size - (size_t)n, " | ks%lx %.110s", (unsigned long)vm_kernel_slide, boot_process_rows[0]);
+    if (n > 0 && (size_t)n + 40 < size && opoios_launchd_trace[0])
+        snprintf(out + n, size - (size_t)n, " | %.190s", opoios_launchd_trace);
 }
 
 static void opoios_sys_report(void *argument, wait_result_t)

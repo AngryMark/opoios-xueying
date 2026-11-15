@@ -52,6 +52,35 @@ static int selected(proc_t p,void *arg) {
  for(unsigned i=0;i<10;++i)if(!strcmp(name,targets[i]))return 1;
  return proc_pid(p)==0 || followed_slot(p)<10;
 }
+// OPOIOS: launchd's first thread in depth, for a user space that stops right after launchd starts (stage 3, device
+// 2026-11-15: one thread waiting, no continuation). The system call it is in (x16 and x0 of its user state) and the
+// return addresses on its kernel stack, from the kernel context saved when it blocked: k<lr> then the frame chain.
+// Read under the thread lock and only inside its kernel stack; pointer authentication codes are stripped. Kernel text
+// addresses keep their low 36 bits (the kernel lives at 0xfffffff0_00000000 and up). SourceStorage.cpp shows the row.
+char opoios_launchd_trace[200];
+static uint64_t opoios_strip(uint64_t value) {
+#if __has_builtin(__builtin_ptrauth_strip)
+ value=(uint64_t)__builtin_ptrauth_strip((void *)value,1);
+#endif
+ return value|0xfffffff000000000ULL;
+}
+static void opoios_trace(thread_t thread) {
+ char *out=opoios_launchd_trace;const size_t size=sizeof(opoios_launchd_trace);
+ int64_t number=0;uint64_t arg0=0;
+ if(thread->machine.upcb){number=(int64_t)get_saved_state_reg(thread->machine.upcb,16);arg0=get_saved_state_reg(thread->machine.upcb,0);}
+ int n=snprintf(out,size,"sys %lld x0 %llx",(long long)number,(unsigned long long)arg0);
+ thread_kernel_state_t state=(thread_kernel_state_t)thread->machine.kstackptr;
+ const uint64_t base=(uint64_t)thread->kernel_stack,top=base+(uint64_t)kernel_stack_size;
+ if(!state || !base || n<=0){if(n>0 && (size_t)n<size)snprintf(out+n,size-(size_t)n," k none");return;}
+ n+=snprintf(out+n,size-(size_t)n," k%09llx",(unsigned long long)(opoios_strip(state->machine.ss.lr)&0xfffffffffULL));
+ uint64_t fp=state->machine.ss.fp;
+ for(unsigned i=0;i<8 && fp>=base && fp+16<=top && !(fp&7) && n>0 && (size_t)n+12<size;++i) {
+  const uint64_t *frame=(const uint64_t *)fp;
+  n+=snprintf(out+n,size-(size_t)n," %09llx",(unsigned long long)(opoios_strip(frame[1])&0xfffffffffULL));
+  if(frame[0]<=fp)break;
+  fp=frame[0];
+ }
+}
 static int capture(proc_t p,void *arg) {
  (void)arg;
  const char *name=proc_best_name(p);unsigned index=10;
@@ -80,6 +109,7 @@ static int capture(proc_t p,void *arg) {
    sampled=1;state=flags;priority=thread->sched_pri;wait=thread->wait_event;
    continuation=(uint64_t)thread->continuation;
    if(thread->machine.upcb)userPC=(uint64_t)get_saved_state_pc(thread->machine.upcb);
+   if(index==0 && (flags&TH_WAIT))opoios_trace(thread);
   }
   thread_unlock(thread);ml_set_interrupts_enabled(irq);
  }
