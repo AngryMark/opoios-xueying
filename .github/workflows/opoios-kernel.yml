@@ -9,6 +9,8 @@ name: opoios-kernel
 # every storage write path (scripts/opoios-check-safe-config.sh), and the board must use dts/xueying.dts, which never
 # enables the UFS controller. The artifacts contain Apple code (the kernelcache's kexts): this repository stays private,
 # artifacts expire after three days.
+#
+# Run: gh workflow run opoios-kernel.yml -R AngryMark/opoios-xueying --ref xueying
 
 on:
   workflow_dispatch:
