@@ -234,20 +234,50 @@ static void opoios_sampler(void *, wait_result_t)
     }
 }
 
+// OPOIOS: where the report thread is: iterations * 10 + the line it is printing (1 I4, 2 I4T, 3 LD, 4 SAMPLE, 5 SYS, 9 between).
+static volatile uint32_t opoios_report_mark;
+
+// OPOIOS: the diagnostic rows for AstonBootScreen.cpp, which draws them itself every 3 s: in two device runs (2026-11-15 20:44,
+// 21:39) no report row reached the message buffer while the screen's clock ran. Lock-free state only, one caller (the screen
+// thread): the Image4 row, the kernel thread inside Image4, launchd through its first task, and the sampler's pid 1 copy with
+// its uptime and step, and the report thread's mark.
+extern "C" unsigned opoios_screen_text(char *out, unsigned size)
+{
+    static char image4[200], image4Thread[260], cached[200], trace[200], pid1[160];
+    uint64_t at = 0;
+    opoios_image4_row(image4, sizeof image4);
+    opoios_image4_thread(image4Thread, sizeof image4Thread);
+    opoios_launchd_cached(cached, sizeof cached, trace, sizeof trace);
+    if (!__atomic_exchange_n(&opoios_publish_lock, 1u, __ATOMIC_ACQUIRE)) {
+        snprintf(pid1, sizeof pid1, "%s", opoios_published_pid1);
+        at = opoios_published_at;
+        __atomic_store_n(&opoios_publish_lock, 0u, __ATOMIC_RELEASE);
+    }
+    const int n = snprintf(out, size, "%s\nI4T %s\nLD %s%s%s\nSAMPLE now %llus at %llus step %u report %u | %s", image4,
+                           image4Thread, cached, trace[0] ? " | " : "", trace, (unsigned long long)opoios_uptime_seconds(),
+                           (unsigned long long)at, (unsigned)opoios_sampler_step, (unsigned)opoios_report_mark, pid1);
+    return n > 0 ? (unsigned)n : 0;
+}
+
 static void opoios_sys_report(void *argument, wait_result_t)
 {
     const unsigned limit = (unsigned)(uintptr_t)argument;
     static char sys[640], pid1[160], image4[360], cached[200], trace[200], image4Thread[260];
     uint64_t at = 0;
+    unsigned iteration = 0;
     for (unsigned elapsed = 0; elapsed < limit;) {
         const unsigned step = limit - elapsed < 15 ? limit - elapsed : 15;
         IOSleep(step * 1000);
         elapsed += step;
+        ++iteration;
         opoios_image4_row(image4, sizeof image4);
+        opoios_report_mark = iteration * 10 + 1;
         printf("%s\n", image4);
         opoios_image4_thread(image4Thread, sizeof image4Thread);
+        opoios_report_mark = iteration * 10 + 2;
         printf("OPOIOS I4T %s\n", image4Thread);
         opoios_launchd_cached(cached, sizeof cached, trace, sizeof trace);
+        opoios_report_mark = iteration * 10 + 3;
         printf("OPOIOS LD %s%s%s\n", cached, trace[0] ? " | " : "", trace);
         if (!__atomic_exchange_n(&opoios_publish_lock, 1u, __ATOMIC_ACQUIRE)) {
             snprintf(sys, sizeof sys, "%s", opoios_published_sys);
@@ -256,10 +286,14 @@ static void opoios_sys_report(void *argument, wait_result_t)
             __atomic_store_n(&opoios_publish_lock, 0u, __ATOMIC_RELEASE);
         }
         const uint64_t now = opoios_uptime_seconds();
+        opoios_report_mark = iteration * 10 + 4;
         printf("OPOIOS SAMPLE now %llus at %llus step %u | %s\n", (unsigned long long)now, (unsigned long long)at,
                (unsigned)opoios_sampler_step, pid1);
+        opoios_report_mark = iteration * 10 + 5;
         printf("%s\n", sys);
+        opoios_report_mark = iteration * 10 + 9;
     }
+    opoios_report_mark = 1000;
     panic("%s\nOPOIOS I4T %s\nOPOIOS LD %s | %s\nOPOIOS SAMPLE at %llus step %u | %s\n%s", image4, image4Thread, cached, trace,
           (unsigned long long)at, (unsigned)opoios_sampler_step, pid1, sys);
 }

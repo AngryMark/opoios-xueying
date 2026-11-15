@@ -27,6 +27,10 @@ extern struct aston_boot_msgbuf *msgbufp;
 extern volatile uint32_t native_legacy_swap_accepted_count __attribute__((weak_import));
 extern volatile int aston_data_capacity_status __attribute__((weak_import));
 extern volatile int aston_migration_rerun_status __attribute__((weak_import));
+// OPOIOS (SourceStorage.cpp): the stage 3 diagnostic rows, newline-separated, built from lock-free state only. Drawn here
+// directly, at the bottom of the log, because in two device runs (2026-11-15 20:44, 21:39) nothing reached the message
+// buffer after launchd started while this screen's clock kept running.
+extern unsigned opoios_screen_text(char *out, unsigned size) __attribute__((weak_import));
 // [0] state: 0 off, 1 drawing, 2 iOS drew (swap accepted), 3 iOS drew (sentinel changed), 4 time limit, -1 no usable framebuffer,
 // -2 no memory, -3 no thread; [1] screens drawn; [2] last second shown.
 volatile int32_t aston_boot_screen_stats[3];
@@ -36,6 +40,8 @@ namespace {
 constexpr unsigned kScale = 3;          // 18 x 42 pixel cells: 70 columns on the 1264-pixel panel
 constexpr unsigned kRows = 48;          // the rows BootProgressDisplay.h keeps
 constexpr unsigned kLogFirst = 6;       // rows 6..47 hold the log
+constexpr unsigned kDiagRows = 12;      // OPOIOS: the last 12 of them hold the diagnostic rows when opoios_screen_text exists
+constexpr uint32_t kDiag = 0x0080ff80;
 constexpr unsigned kTail = 16384;       // bytes of the message buffer looked at
 constexpr unsigned kLimitSeconds = 3600;
 constexpr uint32_t kSentinel = 0x00010203, kTitle = 0x00ffffff, kTrack = 0x00202428, kBar = 0x003a7bd5, kStage = 0x00ffd166,
@@ -94,8 +100,23 @@ const char *stage() {
     return "Starting the kernel and storage.";
 }
 
+// OPOIOS: text wrapped to cols into at most capacity rows of out, from the top; returns the row count.
+unsigned wrapText(const char *text, unsigned cols, char (*out)[BP_COLS], unsigned capacity) {
+    unsigned rows = 0, used = 0;
+    for (const char *p = text; *p && rows < capacity; ++p) {
+        if (*p == '\n' || used == cols) {
+            out[rows++][used] = 0;
+            used = 0;
+            if (*p == '\n' || rows == capacity) continue;
+        }
+        out[rows][used++] = *p == '\t' ? ' ' : *p;
+    }
+    if (rows < capacity && used) out[rows++][used] = 0;
+    return rows;
+}
+
 // The newest lines of the message buffer, wrapped to the screen width, into gLines; returns the row count.
-unsigned tailLines(unsigned cols) {
+unsigned tailLines(unsigned cols, unsigned capacity) {
     aston_boot_msgbuf *m = msgbufp;
     unsigned n = 0;
     if (m && m->msg_bufc && m->msg_size > 0) {
@@ -108,7 +129,6 @@ unsigned tailLines(unsigned cols) {
         }
     }
     gTail[n] = 0;
-    const unsigned capacity = kRows - kLogFirst;
     unsigned rows = 0;
     // Walk the lines from the newest back; each one becomes ceil(length / cols) rows, filled from the bottom.
     unsigned end = n;
@@ -149,6 +169,11 @@ void run(void *, wait_result_t) {
     char row[BP_COLS];
     int lastWrite = -1;
     unsigned lastSecond = ~0u;
+    // OPOIOS: with the diagnostic hook the log keeps the rows above the last kDiagRows.
+    const bool diag = &opoios_screen_text != nullptr;
+    const unsigned logRows = kRows - kLogFirst - (diag ? kDiagRows : 0);
+    static char diagText[1600];
+    static char diagLines[kDiagRows][BP_COLS];
     for (unsigned step = 0;; ++step) {
         int drew = iosDrew();
         if (drew) {aston_boot_screen_stats[0] = drew; gDisplay->yield_requested = 1; break;}
@@ -169,9 +194,17 @@ void run(void *, wait_result_t) {
         int write = m ? m->msg_bufx : -1;
         if (step % 5 == 0 && write != lastWrite) {
             lastWrite = write;
-            unsigned rows = tailLines(cols);
-            for (unsigned r = 0; r < kRows - kLogFirst; ++r) bp_line(gDisplay, kLogFirst + r, r < rows ? gLines[r] : "", kLog);
+            unsigned rows = tailLines(cols, logRows);
+            for (unsigned r = 0; r < logRows; ++r) bp_line(gDisplay, kLogFirst + r, r < rows ? gLines[r] : "", kLog);
             aston_boot_screen_stats[1] = aston_boot_screen_stats[1] + 1;
+        }
+        // OPOIOS: the diagnostic rows every 3 s, from 20 s on (the report's state exists by then).
+        if (diag && step % 30 == 0 && now >= 20) {
+            diagText[0] = 0;
+            opoios_screen_text(diagText, sizeof diagText);
+            unsigned rows = wrapText(diagText, cols, diagLines, kDiagRows);
+            for (unsigned r = 0; r < kDiagRows; ++r)
+                bp_line(gDisplay, kLogFirst + logRows + r, r < rows ? diagLines[r] : "", kDiag);
         }
         IOSleep(100);
     }
