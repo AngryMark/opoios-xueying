@@ -100,7 +100,9 @@ kernel_args = [
   # OPOIOS: opoios-ram-root=1 starts the loader's RAM disk (NativeRamBlock) without UFS: package/SourceStorage.cpp registers
   # only the source IOBlockStorageDevice and NativeRamBlock. Without it nothing starts the disk and the root wait panics
   # (device 2026-11-15: "Failed to mount root device" after waiting for the volume UUID).
-  "rd=md0-ramblock", "opoios-ram-root=1",
+  # opoios-sys-report=60: 60 s after the RAM root starts the kernel panics with one row: root, RAM disk traffic, processes by pid
+  # (package/SourceStorage.cpp), and prints that row every 15 s before. The panic ends the run; the phone then powers off.
+  "rd=md0-ramblock", "opoios-ram-root=1", "opoios-sys-report=60",
   "offline-mobile-graphics-load=1", "offline-mobile-graphics-client=1", "offline-legacy-register=1", "offline-legacy-gop=1",
   "offline-legacy-unit-scale=3", "offline-legacy-pm=1", "offline-legacy-validate=1", "offline-legacy-transfer=1",
   "offline-legacy-cpu-present=1", "offline-legacy-phase=4", "offline-key-events=1", "sheng-buttons=1",

@@ -80,6 +80,78 @@ static void start_data_disk(IOService *provider)
     printf("SourceStorage: Data disk started\n");
 }
 
+// OPOIOS: how far the system got, as one row, for a phone without a serial console or storage for logs.
+// opoios-sys-report=<seconds> (15 to 3600) starts a kernel thread with the RAM root: every 15 s it prints the row on the
+// console, and when the time is up it panics with it, so the panic screen shows the root, the RAM disk traffic and the
+// processes by pid (as OddlyLabs/unixnu-fuxi's SYS row). It only reads kernel state. The process ABI is declared here
+// with opaque types, as BootProcessProbe.c does, to keep the BSD headers out of this IOKit translation unit.
+extern "C" {
+struct proc;
+struct vnode;
+struct mount;
+struct proc *proc_find(int);
+int proc_rele(struct proc *);
+struct vnode *vfs_rootvnode(void);
+struct mount *vnode_mount(struct vnode *);
+void vfs_name(struct mount *, char *);
+int vnode_put(struct vnode *);
+extern dev_t rootdev;
+extern volatile uint64_t native_ram_block_reads, native_ram_block_writes, native_ram_block_failures;
+}
+
+static void opoios_sys_row(char *out, size_t size, unsigned seconds)
+{
+    char fs[16] = "none";
+    struct vnode *root = vfs_rootvnode();
+    if (root) {
+        vfs_name(vnode_mount(root), fs);
+        vnode_put(root);
+    }
+    int n = snprintf(out, size, "OPOIOS SYS %us root %s %u,%u ram r%llu w%llu f%llu |", seconds, fs,
+                     (unsigned)((rootdev >> 24) & 0xff), (unsigned)(rootdev & 0xffffff),
+                     (unsigned long long)native_ram_block_reads, (unsigned long long)native_ram_block_writes,
+                     (unsigned long long)native_ram_block_failures);
+    unsigned found = 0;
+    for (int pid = 0; pid < 4000; ++pid) {
+        struct proc *p = proc_find(pid);
+        if (!p) continue;
+        ++found;
+        if (found <= 16 && n > 0 && (size_t)n + 40 < size) {
+            const char *name = proc_best_name(p);
+            n += snprintf(out + n, size - (size_t)n, " %d:%.24s", pid, name ? name : "?");
+        }
+        proc_rele(p);
+    }
+    if (n > 0 && (size_t)n + 12 < size) snprintf(out + n, size - (size_t)n, " | n%u", found);
+}
+
+static void opoios_sys_report(void *argument, wait_result_t)
+{
+    const unsigned limit = (unsigned)(uintptr_t)argument;
+    char row[640] = "";
+    for (unsigned elapsed = 0; elapsed < limit;) {
+        const unsigned step = limit - elapsed < 15 ? limit - elapsed : 15;
+        IOSleep(step * 1000);
+        elapsed += step;
+        opoios_sys_row(row, sizeof row, elapsed);
+        printf("%s\n", row);
+    }
+    panic("%s", row);
+}
+
+static void opoios_sys_report_start(void)
+{
+    unsigned seconds = 0;
+    if (!PE_parse_boot_argn("opoios-sys-report", &seconds, sizeof(seconds)) || !seconds) return;
+    if (seconds < 15) seconds = 15;
+    if (seconds > 3600) seconds = 3600;
+    thread_t thread;
+    if (kernel_thread_start(opoios_sys_report, (void *)(uintptr_t)seconds, &thread) == KERN_SUCCESS) {
+        thread_deallocate(thread);
+        printf("SourceStorage: OPOIOS system report in %u s\n", seconds);
+    }
+}
+
 // OPOIOS: the loader's RAM disk as the only storage (stage 3 RAM root, rd=md0-ramblock). With opoios-ram-root=1 and
 // the source-storage argument off, only the source IOBlockStorageDevice and NativeRamBlock are registered and the RAM
 // disk is started on the platform root. NativeUfs is never registered, created or started, so nothing reaches the
@@ -120,6 +192,7 @@ static void opoios_ram_root_start(void)
     if (!seed) panic("SourceStorage: OPOIOS RAM root: the loader handed over no RAM disk");
     start_data_disk(provider);
     printf("SourceStorage: OPOIOS RAM root started, no UFS\n");
+    opoios_sys_report_start();
 }
 
 extern "C" void native_source_storage_start(void)
