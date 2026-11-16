@@ -74,6 +74,11 @@ roots = [
   "com.apple.iokit.IOSurface", "com.apple.kec.Libm", "com.apple.kec.corecrypto", "com.apple.kext.AppleMatch", "com.apple.kext.CoreTrust",
   "com.apple.security.AppleImage4", "com.apple.security.sandbox", "com.apple.iokit.IOHIDFamily",
   "com.apple.iokit.IOUSBDeviceFamily", "com.apple.driver.AppleUSBXDCI", "com.apple.driver.AppleUSBDeviceMux",
+  # OPOIOS: restored_external's USB description has AppleUSBMux plus AppleUSBNCMControlAux and AppleUSBNCMDataAux. With no
+  # function driver for the two NCM interfaces, IOUSBDeviceController gives up 10 s later ("Giving up with 2 function(s)
+  # unregistered") and never goes on the bus (phone run 2026-11-16 05:41 UTC). Adds com.apple.driver.usb.networking and
+  # com.apple.iokit.IONetworkingFamily as its libraries.
+  "com.apple.driver.AppleUSBDeviceNCM",
   "com.apple.iokit.IOUSBHostFamily", "com.apple.driver.usb.AppleUSBXHCI", "com.apple.driver.usb.AppleUSBHub",
   "com.apple.driver.usb.AppleUSBHostCompositeDevice", "com.apple.driver.usb.IOUSBHostHIDDevice", "com.apple.iokit.IOUSBMassStorageDriver",
   "com.apple.iokit.IOSCSIArchitectureModelFamily", "com.apple.iokit.IOSCSIBlockCommandsDevice",
