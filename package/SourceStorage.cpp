@@ -372,7 +372,7 @@ extern "C" unsigned opoios_screen_text(char *out, unsigned size)
 static void opoios_sys_report(void *argument, wait_result_t)
 {
     const unsigned limit = (unsigned)(uintptr_t)argument;
-    static char sys[640], pid1[160], image4[360], cached[200], trace[200], image4Thread[260], busy[480];
+    static char sys[640], pid1[160], image4[360], cached[200], trace[200], image4Thread[420], busy[480];
     uint64_t at = 0;
     unsigned iteration = 0;
     for (unsigned elapsed = 0; elapsed < limit;) {

@@ -191,12 +191,24 @@ void opoios_launchd_cached(char *out,size_t size,char *trace,size_t tsize) {
 // kernel_task's threads with try-locks only: the first waiting one with a kernel frame returning into Image4's __TEXT_EXEC
 // (the 24A446 fileset range, which this kernel keeps, plus the slide). Its name, wait event, state, and the frames from three
 // before the first Image4 one (low 36 bits, as opoios_trace). For the report thread.
+// OPOIOS: any component's code instead of Image4's (stage 3, device 2026-11-17: the USB NCM data interface never finishes
+// matching, so AppleUSBDeviceNCM11Data::start waits somewhere and restored_external waits on the USB controller):
+// opoios-trace-lo=<fileset address> and opoios-trace-size=<bytes> select the range (label "kx"), and the row then shows the
+// frames from the innermost one out to one past the first frame in the range, which is where the thread waits.
 extern task_t kernel_task;
 extern vm_offset_t vm_kernel_slide;
 void opoios_image4_thread(char *out,size_t size) {
- const uint64_t lo=0xfffffff00a8697a0ULL+vm_kernel_slide,hi=lo+0x11358;
+ static uint64_t range_lo,range_size;static int range_custom=-1;
+ if(range_custom<0) {
+  uint64_t value_lo=0,value_size=0;
+  range_custom=PE_parse_boot_argn("opoios-trace-lo",&value_lo,sizeof(value_lo)) && value_lo
+   && PE_parse_boot_argn("opoios-trace-size",&value_size,sizeof(value_size)) && value_size;
+  range_lo=range_custom?value_lo:0xfffffff00a8697a0ULL;range_size=range_custom?value_size:0x11358;
+ }
+ const char *label=range_custom?"kx":"i4";
+ const uint64_t lo=range_lo+vm_kernel_slide,hi=lo+range_size;
  task_t task=kernel_task;
- if(!task || !task_lock_try(task)){snprintf(out,size,"i4 thread: kernel_task busy");return;}
+ if(!task || !task_lock_try(task)){snprintf(out,size,"%s thread: kernel_task busy",label);return;}
  unsigned count=0,waiting=0,busy=0,found=0;
  thread_t thread;
  queue_iterate(&task->threads,thread,thread_t,task_threads){
@@ -221,8 +233,10 @@ void opoios_image4_thread(char *out,size_t size) {
    }
    if(first>=0) {
     char name[64]={};thread_get_thread_name(thread,name);
-    int n=snprintf(out,size,"i4 thread %.24s W%llx s%x d%u:",name,(unsigned long long)thread->wait_event,(unsigned)thread->state,depth);
-    for(unsigned i=first>3?(unsigned)first-3:0;i<depth && n>0 && (size_t)n+12<size;++i)
+    int n=snprintf(out,size,"%s thread %.24s W%llx s%x d%u f%d:",label,name,(unsigned long long)thread->wait_event,(unsigned)thread->state,
+                   depth,first);
+    const unsigned from=range_custom?0:(first>3?(unsigned)first-3:0),to=range_custom?(unsigned)first+2:depth;
+    for(unsigned i=from;i<to && i<depth && n>0 && (size_t)n+12<size;++i)
      n+=snprintf(out+n,size-(size_t)n," %09llx",(unsigned long long)(frames[i]&0xfffffffffULL));
     found=1;
    }
@@ -231,7 +245,8 @@ void opoios_image4_thread(char *out,size_t size) {
   if(found)break;
  }
  task_unlock(task);
- if(!found)snprintf(out,size,"i4 thread: none of %u kernel threads (%u waiting, %u busy) is in Image4",count,waiting,busy);
+ if(!found)snprintf(out,size,"%s thread: none of %u kernel threads (%u waiting, %u busy) is in %s",label,count,waiting,busy,
+                    range_custom?"the traced range":"Image4");
 }
 void boot_process_capture(void) {
  // Exactly one capture worker. Refuse reentry without waiting or modifying its
