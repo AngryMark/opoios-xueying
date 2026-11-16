@@ -26,3 +26,5 @@ aston-interface-namer-overlay.patch
 aston-display-window.patch
 # OPOIOS: Linux build with upstream clang (no 4-argument __ptrauth); see the patch comment.
 opoios-upstream-clang-ptrauth-null.patch
+# OPOIOS: copy user space /dev/console output into the message buffer with opoios-console-msgbuf=1 (restored_external logs there).
+opoios-console-msgbuf.patch

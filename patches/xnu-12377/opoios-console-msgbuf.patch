@@ -1,0 +1,40 @@
+--- a/bsd/dev/arm/km.c
++++ b/bsd/dev/arm/km.c
+@@ -43,6 +43,29 @@
+  */
+ int             initialized = 0;
+ 
++/*
++ * OPOIOS: user space console output (launchd's StandardOutPath/StandardErrorPath /dev/console, as restored_external has) only
++ * reaches console_write(), which has no visible sink on the OnePlus Open. With opoios-console-msgbuf=1 every byte written to
++ * /dev/console is also copied into the kernel message buffer, which the boot screen and the boot log show.
++ */
++static int      opoios_console_msgbuf = -1;
++
++static void
++opoios_console_mirror(const unsigned char *buf, int cc)
++{
++	if (opoios_console_msgbuf < 0) {
++		int on = 0;
++		(void) PE_parse_boot_argn("opoios-console-msgbuf", &on, sizeof(on));
++		opoios_console_msgbuf = on ? 1 : 0;
++	}
++	if (!opoios_console_msgbuf) {
++		return;
++	}
++	for (int i = 0; i < cc; i++) {
++		log_putc((char)buf[i]);
++	}
++}
++
+ static int      kmoutput(struct tty * tp);
+ static void     kmstart(struct tty * tp);
+ 
+@@ -363,6 +386,7 @@
+ 		} else {
+ 			kmputc(tp->t_dev, *buf);
+ 		}
++		opoios_console_mirror(buf, cc);
+ 	}
+ 	/*
+ 	 * XXX This is likely not necessary, as the tty output queue is not
