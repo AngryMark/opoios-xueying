@@ -117,6 +117,8 @@ extern volatile uint32_t opoios_image4_monitor_calls;
 // BootProcessProbe.c: the kernel thread waiting inside Image4's code, with its frames (try-locks only).
 void opoios_image4_thread(char *out, size_t size);
 boolean_t ml_validate_nofault(vm_offset_t virtsrc, vm_size_t size);
+// drivers/QcomDwc3 (USB device mode, sheng-usb=1): its counters, see the index list at the top of QcomDwc3.cpp.
+extern volatile uint32_t native_usb_stats[54];
 }
 
 // OPOIOS: AppleImage4's userspace cork and Image4's start (stage 3, device 2026-11-15). launchd waits in AppleImage4's sysctl
@@ -297,19 +299,23 @@ static void opoios_panic_row(char *out, size_t size)
 // its uptime and step, and the report thread's mark.
 extern "C" unsigned opoios_screen_text(char *out, unsigned size)
 {
-    static char image4[200], image4Thread[260], cached[200], trace[200], pid1[160], panicRow[560];
+    static char image4[200], cached[200], trace[200], pid1[160], panicRow[560], usb[240];
     uint64_t at = 0;
     opoios_panic_row(panicRow, sizeof panicRow);
     opoios_image4_row(image4, sizeof image4);
-    opoios_image4_thread(image4Thread, sizeof image4Thread);
     opoios_launchd_cached(cached, sizeof cached, trace, sizeof trace);
     if (!__atomic_exchange_n(&opoios_publish_lock, 1u, __ATOMIC_ACQUIRE)) {
         snprintf(pid1, sizeof pid1, "%s", opoios_published_pid1);
         at = opoios_published_at;
         __atomic_store_n(&opoios_publish_lock, 0u, __ATOMIC_RELEASE);
     }
-    const int n = snprintf(out, size, "%s\n%s\nI4T %s\nLD %s%s%s\nSAMPLE now %llus at %llus step %u report %u | %s", panicRow,
-                           image4, image4Thread, cached, trace[0] ? " | " : "", trace, (unsigned long long)opoios_uptime_seconds(),
+    // USB device mode (QcomDwc3): stage (negative: the step that failed), GSNPSID, GDSC USB30/PHY, SMMU slot, repeater status | APID,
+    // rails found, XDCI kext load, controller started, power on calls, interrupts, DSTS at power on, role, VBUS changes.
+    const volatile uint32_t *u = native_usb_stats;
+    snprintf(usb, sizeof usb, "USB st %d id %x gdsc %x/%x smmu %x rep %x rails %x xdci %x start %u on %u irq %u dsts %x role %x vbus %x",
+             (int)u[0], u[1], u[5], u[6], u[7], u[8], u[9], u[21], u[19], u[12], u[11], u[15], u[44], u[35]);
+    const int n = snprintf(out, size, "%s\n%s\n%s\nLD %s%s%s\nSAMPLE now %llus at %llus step %u report %u | %s", panicRow, usb,
+                           image4, cached, trace[0] ? " | " : "", trace, (unsigned long long)opoios_uptime_seconds(),
                            (unsigned long long)at, (unsigned)opoios_sampler_step, (unsigned)opoios_report_mark, pid1);
     return n > 0 ? (unsigned)n : 0;
 }

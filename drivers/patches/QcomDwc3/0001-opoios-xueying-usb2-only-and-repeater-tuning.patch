@@ -1,0 +1,32 @@
+diff --git a/QcomDwc3.cpp b/QcomDwc3.cpp
+index 806fbe3..0fca84a 100644
+--- a/QcomDwc3.cpp
++++ b/QcomDwc3.cpp
+@@ -591,7 +591,12 @@ bool bringUp() {
+     stage(7);
+     phyInit();
+     IOSleep(2);
+-    gSuperSpeed = superSpeedInit();
++    // OPOIOS (OnePlus Open): USB 2.0 only unless sheng-usb-ss=1. The SuperSpeed path brings up sheng's PS5169 retimer: it drives
++    // TLMM GPIO 7 (the retimer's reset there), muxes GPIO 28/29 to QUP1 SE0 I2C and writes I2C address 0x28 on i2c@a80000. This
++    // phone has no PS5169 (its own device tree lists an FSA4480 switch on i2c@988000 instead), and those pins may serve other parts.
++    unsigned superSpeed = 0;
++    PE_parse_boot_argn("sheng-usb-ss", &superSpeed, sizeof superSpeed);
++    gSuperSpeed = superSpeed == 1 && superSpeedInit();
+     if (!gSuperSpeed) selectUtmiClock();
+     stage(8);
+     Region window = {};
+diff --git a/QcomEusb2Phy.h b/QcomEusb2Phy.h
+index fb26a93..c9aba56 100644
+--- a/QcomEusb2Phy.h
++++ b/QcomEusb2Phy.h
+@@ -41,5 +41,8 @@ static const struct QcomMaskedWrite kQcomEusb2Init[] = {
+ /* PM8550B repeater, offsets from its peripheral base (SID 7, 0xfd00): enable, then the PMIC tuning table. */
+ enum {kQcomRepeaterStatus = 0x08, kQcomRepeaterOk = 0x80, kQcomRepeaterEnable = 0x46, kQcomRepeaterEnableBit = 0x80,
+       kQcomRepeaterForceEn5 = 0xe8, kQcomRepeaterForceVal5 = 0xed};
+-static const struct {uint8_t offset, value;} kQcomRepeaterTune[] = {{0x51, 0x08}, {0x54, 0x03}, {0x57, 0x05}};
++/* OPOIOS (OnePlus Open, xueying): the device-mode tuning of this phone's repeater, from its own device tree (pm8550b@7
++ * eusb2-repeater@fd00, qcom,param-override-seq = <0x0e 0x51 0x06 0x53 0x03 0x54 0x06 0x57>, value then offset). The sheng
++ * table was {0x51, 0x08}, {0x54, 0x03}, {0x57, 0x05}. */
++static const struct {uint8_t offset, value;} kQcomRepeaterTune[] = {{0x51, 0x0e}, {0x53, 0x06}, {0x54, 0x03}, {0x57, 0x06}};
+ #endif

@@ -119,6 +119,11 @@ kernel_args = [
   # restored_external like the one-CPU boot (device 2026-11-15 23:23).
   "smp=1", "armcpu-spi-ipi=1", "armcpu-self-ipi=1",
   "no-lc=1", "vsync=60", "vsync-fixed=1", "sheng-disable-watchdogd=1", "sheng-lite=1",
+  # OPOIOS: USB device mode (drivers/QcomDwc3 behind Apple's AppleUSBXDCI), USB 2.0 only (no sheng-usb-ss: this phone has no
+  # PS5169 retimer). Checked against this phone's own device tree: controller 0xa600000, eUSB2 PHY 0x88e3000, repeater on pm8550b
+  # SID 7 at 0xfd00 (tuning from its param-override-seq), rails L1E 880 mV, L3E 1200 mV, L15B 1800 mV, L5B 3104 mV, L3F 912 mV.
+  # Without the charger or UCSI (no ADSP here) the driver takes the device role.
+  "sheng-usb=1",
 ]
 
 [payload.adt]
