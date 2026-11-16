@@ -8,6 +8,8 @@
 #include <mach/kmod.h>
 #include <pexpert/pexpert.h>
 #include <IOKit/IOLib.h>
+#include <libkern/c++/OSOrderedSet.h>
+#include <libkern/c++/OSIterator.h>
 #include <kern/thread.h>
 
 extern kmod_info_t g_kernel_kmod_info;
@@ -212,22 +214,66 @@ static void opoios_sys_row(char *out, size_t size, unsigned seconds)
 // the samples that take process references (pid 1, then the process list) run in this worker every 3 s and publish their
 // last result with its uptime; the report prints that copy with its age and the step the worker is in (1: pid 1,
 // 2: process list, 0: sleeping), and itself reads only lock-free state: the Image4 row and launchd's task first seen.
-static char opoios_published_sys[640], opoios_published_pid1[160];
+static char opoios_published_sys[640], opoios_published_pid1[160], opoios_published_busy[480];
 static uint64_t opoios_published_at;
 static volatile uint32_t opoios_sampler_step;
 static uint32_t opoios_publish_lock;
 
+// OPOIOS: the IOKit services that hold the registry busy (stage 3, device 2026-11-17: restored_external, after setting
+// the USB description, waits in IOServiceWaitQuiet on QcomDwc3Xdci@0 with no timeout and never finishes enable_usb, so
+// nobody accepts on port 62078). The busy leaves, as IOService::waitQuietWithOptions names them on a timeout: busy
+// services none of whose service plane children is busy, as name<class>@provider, busy count and state. The registry
+// lock may wait, so only the sampler worker builds this row (step 3).
+static void opoios_busy_row(char *out, size_t size)
+{
+    IOService *root = IOService::getServiceRoot();
+    unsigned busy = 0, leaves = 0;
+    int n = snprintf(out, size, "BUSY root %u", root ? (unsigned)root->getBusyState() : 0u);
+    IORegistryIterator *iter = root ? IORegistryIterator::iterateOver(root, gIOServicePlane, kIORegistryIterateRecursively) : nullptr;
+    OSOrderedSet *all = iter ? iter->iterateAll() : nullptr;
+    const unsigned count = all ? all->getCount() : 0;
+    for (unsigned i = 0; i < count; ++i) {
+        IOService *service = OSDynamicCast(IOService, all->getObject(i));
+        if (!service || !service->getBusyState()) continue;
+        ++busy;
+        bool busyChild = false;
+        OSIterator *children = service->getChildIterator(gIOServicePlane);
+        if (children) {
+            OSObject *object;
+            while (!busyChild && (object = children->getNextObject())) {
+                IOService *child = OSDynamicCast(IOService, object);
+                busyChild = child && child->getBusyState();
+            }
+            children->release();
+        }
+        if (busyChild) continue;
+        ++leaves;
+        IOService *provider = service->getProvider();
+        if (n > 0 && (size_t)n + 64 < size)
+            n += snprintf(out + n, size - (size_t)n, " | %.32s<%.32s>@%.24s b%u s%x", service->getName(),
+                          service->getMetaClass()->getClassName(), provider ? provider->getName() : "-",
+                          (unsigned)service->getBusyState(), (unsigned)service->getState());
+    }
+    if (n > 0 && (size_t)n + 40 < size)
+        snprintf(out + n, size - (size_t)n, " | %u services, %u busy, %u leaves%s", count, busy, leaves, all ? "" : " (no list)");
+    OSSafeReleaseNULL(all);
+    OSSafeReleaseNULL(iter);
+}
+
 static void opoios_sampler(void *, wait_result_t)
 {
-    static char sys[640];
+    static char sys[640], busy[480];
     for (;;) {
         opoios_sampler_step = 1;
         opoios_launchd_sample();
         opoios_sampler_step = 2;
         const uint64_t at = opoios_uptime_seconds();
         opoios_sys_row(sys, sizeof sys, (unsigned)at);
+        opoios_sampler_step = 3;
+        opoios_busy_row(busy, sizeof busy);
         while (__atomic_exchange_n(&opoios_publish_lock, 1u, __ATOMIC_ACQUIRE)) {}
         snprintf(opoios_published_sys, sizeof opoios_published_sys, "%s", sys);
+        snprintf(opoios_published_busy, sizeof opoios_published_busy, "%s", busy);
         snprintf(opoios_published_pid1, sizeof opoios_published_pid1, "%s", opoios_launchd_direct);
         opoios_published_at = at;
         __atomic_store_n(&opoios_publish_lock, 0u, __ATOMIC_RELEASE);
@@ -236,7 +282,8 @@ static void opoios_sampler(void *, wait_result_t)
     }
 }
 
-// OPOIOS: where the report thread is: iterations * 10 + the line it is printing (1 I4, 2 I4T, 3 LD, 4 SAMPLE, 5 SYS, 9 between).
+// OPOIOS: where the report thread is: iterations * 10 + the line it is printing (1 I4, 2 I4T, 3 LD, 4 SAMPLE, 5 SYS, 6 BUSY,
+// 9 between).
 static volatile uint32_t opoios_report_mark;
 
 // OPOIOS: a panic that never finishes (device 2026-11-15 22:07: from about 52 s a panic screen started to draw, its first line
@@ -299,13 +346,14 @@ static void opoios_panic_row(char *out, size_t size)
 // its uptime and step, and the report thread's mark.
 extern "C" unsigned opoios_screen_text(char *out, unsigned size)
 {
-    static char image4[200], cached[200], trace[200], pid1[160], panicRow[560], usb[240];
+    static char image4[200], cached[200], trace[200], pid1[160], panicRow[560], usb[240], busy[480];
     uint64_t at = 0;
     opoios_panic_row(panicRow, sizeof panicRow);
     opoios_image4_row(image4, sizeof image4);
     opoios_launchd_cached(cached, sizeof cached, trace, sizeof trace);
     if (!__atomic_exchange_n(&opoios_publish_lock, 1u, __ATOMIC_ACQUIRE)) {
         snprintf(pid1, sizeof pid1, "%s", opoios_published_pid1);
+        snprintf(busy, sizeof busy, "%s", opoios_published_busy);
         at = opoios_published_at;
         __atomic_store_n(&opoios_publish_lock, 0u, __ATOMIC_RELEASE);
     }
@@ -314,8 +362,9 @@ extern "C" unsigned opoios_screen_text(char *out, unsigned size)
     const volatile uint32_t *u = native_usb_stats;
     snprintf(usb, sizeof usb, "USB st %d id %x gdsc %x/%x smmu %x rep %x rails %x xdci %x start %u on %u irq %u dsts %x role %x vbus %x",
              (int)u[0], u[1], u[5], u[6], u[7], u[8], u[9], u[21], u[19], u[12], u[11], u[15], u[44], u[35]);
-    const int n = snprintf(out, size, "%s\n%s\n%s\nLD %s%s%s\nSAMPLE now %llus at %llus step %u report %u | %s", panicRow, usb,
-                           image4, cached, trace[0] ? " | " : "", trace, (unsigned long long)opoios_uptime_seconds(),
+    // The busy row right after USB: the screen keeps only the first kDiagRows wrapped rows.
+    const int n = snprintf(out, size, "%s\n%s\n%s\n%s\nLD %s%s%s\nSAMPLE now %llus at %llus step %u report %u | %s", panicRow, usb,
+                           busy, image4, cached, trace[0] ? " | " : "", trace, (unsigned long long)opoios_uptime_seconds(),
                            (unsigned long long)at, (unsigned)opoios_sampler_step, (unsigned)opoios_report_mark, pid1);
     return n > 0 ? (unsigned)n : 0;
 }
@@ -323,7 +372,7 @@ extern "C" unsigned opoios_screen_text(char *out, unsigned size)
 static void opoios_sys_report(void *argument, wait_result_t)
 {
     const unsigned limit = (unsigned)(uintptr_t)argument;
-    static char sys[640], pid1[160], image4[360], cached[200], trace[200], image4Thread[260];
+    static char sys[640], pid1[160], image4[360], cached[200], trace[200], image4Thread[260], busy[480];
     uint64_t at = 0;
     unsigned iteration = 0;
     for (unsigned elapsed = 0; elapsed < limit;) {
@@ -342,6 +391,7 @@ static void opoios_sys_report(void *argument, wait_result_t)
         printf("OPOIOS LD %s%s%s\n", cached, trace[0] ? " | " : "", trace);
         if (!__atomic_exchange_n(&opoios_publish_lock, 1u, __ATOMIC_ACQUIRE)) {
             snprintf(sys, sizeof sys, "%s", opoios_published_sys);
+            snprintf(busy, sizeof busy, "%s", opoios_published_busy);
             snprintf(pid1, sizeof pid1, "%s", opoios_published_pid1);
             at = opoios_published_at;
             __atomic_store_n(&opoios_publish_lock, 0u, __ATOMIC_RELEASE);
@@ -352,11 +402,13 @@ static void opoios_sys_report(void *argument, wait_result_t)
                (unsigned)opoios_sampler_step, pid1);
         opoios_report_mark = iteration * 10 + 5;
         printf("%s\n", sys);
+        opoios_report_mark = iteration * 10 + 6;
+        printf("OPOIOS %s\n", busy);
         opoios_report_mark = iteration * 10 + 9;
     }
     opoios_report_mark = 1000;
-    panic("%s\nOPOIOS I4T %s\nOPOIOS LD %s | %s\nOPOIOS SAMPLE at %llus step %u | %s\n%s", image4, image4Thread, cached, trace,
-          (unsigned long long)at, (unsigned)opoios_sampler_step, pid1, sys);
+    panic("%s\nOPOIOS I4T %s\nOPOIOS LD %s | %s\nOPOIOS SAMPLE at %llus step %u | %s\n%s\nOPOIOS %s", image4, image4Thread, cached,
+          trace, (unsigned long long)at, (unsigned)opoios_sampler_step, pid1, sys, busy);
 }
 
 static void opoios_sys_report_start(void)
