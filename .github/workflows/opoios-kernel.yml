@@ -2,15 +2,24 @@ name: opoios-kernel
 
 # OPOIOS: the OnePlus Open (xueying) iOS 27 kernel (24A446 as iPhone17,2) on a macOS runner with Xcode's clang, the toolchain
 # UniXNU-aston builds the same kernel with (its .github/workflows/package.yml, which this follows). Kernel only: no payload,
-# no Data seed, no firmware, no boot image; those are made on the owner's PC. No secrets are needed: the platform seed
-# (UNIXNU_UNIQUE_CHIP_ID) belongs to the payload step.
+# no Data seed, no firmware, no boot image; those are made on the owner's PC. No repository secrets: the platform seed
+# (UNIXNU_UNIQUE_CHIP_ID) belongs to the payload step on the PC.
 #
 # Safety: the phone is the owner's only daily phone. Before building, the configuration this kernel reads is checked for
 # every storage write path (scripts/opoios-check-safe-config.sh), and the board must use dts/xueying.dts, which never
-# enables the UFS controller. The artifacts contain Apple code (the kernelcache's kexts): this repository stays private,
-# artifacts expire after three days.
+# enables the UFS controller.
 #
-# Run: gh workflow run opoios-kernel.yml -R AngryMark/opoios-xueying --ref xueying
+# Public repository (OPOIOS docs/05-public-ci.md). Anyone signed in to GitHub can download artifacts and read job logs, so:
+# - nothing derived from Apple software leaves the runner in the clear: the kernel, the reference kernels, the prelink maps
+#   and the build logs are sealed by scripts/opoios-ci-seal.sh to the owner's public key ci/opoios-artifact-recipient.pem
+#   (as OddlyLabs/unixnu-fuxi seals its boot image); only the owner's PC can open them (OPOIOS scripts/ci-artifact.sh);
+# - no actions/cache: a cache of the default branch can be restored by pull-request workflows, and it would hold IPSW
+#   members (Apple files). The IPSW components come from Apple's CDN on every run;
+# - manual start only, and only in the owner's repository (forks run nothing); actions pinned to commit SHAs; checkouts
+#   keep no credentials; the GITHUB_TOKEN can only read.
+#
+# Run: gh workflow run opoios-kernel.yml -R <owner>/<repo> --ref xueying
+#      then, on the PC (WSL): bash scripts/ci-artifact.sh fetch <run-id>   (OPOIOS project)
 
 on:
   workflow_dispatch:
@@ -24,24 +33,30 @@ concurrency:
 
 env:
   WORK: UniXNU/out/xueying/ios-27.0.1-24A446/aston_ios27
+  SEALED: ${{ github.workspace }}/sealed
 
 jobs:
   kernel:
+    # Only the owner's repository builds: a fork has no recipient it could legitimately seal to, and spends nobody's minutes.
+    if: github.repository_owner == 'AngryMark'
     runs-on: macos-26
     timeout-minutes: 180
     env:
       # The Xcode UniXNU-aston builds the 24A446 kernel with; pinned so a runner image update does not change the compiler.
       DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           path: UniXNU-xueying
+          persist-credentials: false
       - name: safety gate
         working-directory: UniXNU-xueying
         run: |
           grep -q '^source = "device:dts/xueying.dts"' board.toml || { echo "::error::board.toml must use dts/xueying.dts"; exit 1; }
           bash scripts/opoios-check-safe-config.sh board.toml dts/xueying.dts configs/aston_ios27_defconfig
-      - uses: actions/checkout@v4
+          # Nothing leaves this runner unencrypted: without the owner's public key the build does not even start.
+          [ -s ci/opoios-artifact-recipient.pem ] || { echo "::error::ci/opoios-artifact-recipient.pem is missing"; exit 1; }
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: UniXNU/UniXNU
           # UniXNU main as of 2026-11-10, the pin of UniXNU-aston b8832d72 (its package.yml): the combination that boots on
@@ -49,6 +64,7 @@ jobs:
           ref: 00f47f6875749dec49bb782718dff1de28006856
           path: UniXNU
           submodules: false
+          persist-credentials: false
       - name: UniXNU submodules
         # As aston: AppleKeyStoreState's pin 6ff4f11d may be missing from its repository; then its main 58e5461 (the pin only
         # renamed boot arguments, and the driver reads none), recorded in the index so unixnu keeps it.
@@ -65,19 +81,20 @@ jobs:
             echo "::warning::AppleKeyStoreState at 58e5461 instead of the unfetchable pin"
           fi
           git submodule status --recursive | awk '{print $1, $2}' | head -40
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         # Only the boot-screen font (build-gop-legacy-display-27.py reads Font.h through UNIXNU_UEFI), as aston.
         with:
           repository: Project-Silicium/Mu-Silicium
           ref: 6b3d90b79e191e08171bfedd3980234a7e49d340
           path: Mu-Silicium
           sparse-checkout: Silicon/Silicium/SiliciumPkg/Library/FrameBufferSerialPortLib
+          persist-credentials: false
       - name: tools
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           for attempt in 1 2 3; do
-            brew install dtc llvm lld cmake mtools ninja bison pkgconf blacktop/tap/ipsw && break
+            brew install dtc llvm lld cmake mtools ninja bison pkgconf openssl@3 blacktop/tap/ipsw && break
             echo "::warning::brew install failed (attempt $attempt)"; sleep 45
           done
           if ! command -v ipsw >/dev/null; then
@@ -93,10 +110,13 @@ jobs:
             echo "/opt/homebrew/opt/bison/bin"
           } >> "$GITHUB_PATH"
           export PATH="/opt/homebrew/opt/llvm/bin:/opt/homebrew/opt/lld/bin:/opt/homebrew/opt/bison/bin:$PATH"
+          # The seal step needs OpenSSL 3 (RSA-OAEP options); macOS's own openssl is LibreSSL.
+          echo "OPENSSL=$(brew --prefix openssl@3)/bin/openssl" >> "$GITHUB_ENV"
           ok=1
           for t in clang xcodebuild make git ninja cmake dtc fdtget fdtput compression_tool ipsw llvm-objcopy llvm-nm; do
             command -v "$t" >/dev/null || { echo "missing tool: $t"; ok=0; }
           done
+          [ -x "$(brew --prefix openssl@3)/bin/openssl" ] || { echo "missing tool: openssl@3"; ok=0; }
           [ -f Mu-Silicium/Silicon/Silicium/SiliciumPkg/Library/FrameBufferSerialPortLib/Font.h ] || { echo "missing Font.h"; ok=0; }
           [ "$ok" = 1 ]
           xcodebuild -version
@@ -120,14 +140,6 @@ jobs:
             for p in "$d"*.patch; do echo "apply $p in $path"; git -C "$path" apply "$(pwd)/$p"; done
           done
           cp ../UniXNU-xueying/scripts/fileset-24A446-d94ap-symbols.json kits/XnuPrelink/fixtures/
-      - uses: actions/cache@v4
-        # The IPSW components (kernelcache, device tree, trust caches, restore ramdisk; about 270 MB from Apple's CDN) and the
-        # source feeds, so a rerun does not download them again. The cache is private to this repository.
-        with:
-          path: |
-            UniXNU/out/ipsw
-            UniXNU/out/feeds
-          key: opoios-inputs-${{ hashFiles('UniXNU-xueying/unixnu.lock', 'UniXNU-xueying/feeds.toml', 'UniXNU-xueying/unixnu-patches/0001-ios-27.0.1-24A446-iphone17-2.patch') }}
       - name: kernel
         working-directory: UniXNU
         env:
@@ -140,51 +152,75 @@ jobs:
           ./unixnu fetch -D ../UniXNU-xueying
           ./unixnu ipsw fetch -D ../UniXNU-xueying
           ./unixnu build kernel -D ../UniXNU-xueying
+
+      # Everything below seals first and uploads only the sealed directory (*.tar.gz.enc, *.key.enc, *.sha256).
+      - name: seal logs
+        if: always()
+        env:
+          SEAL_ALLOW_MISSING: "1"
+        run: |
+          bash UniXNU-xueying/scripts/opoios-ci-seal.sh logs "$WORK" "$SEALED/logs" \
+            'logs/*.log' \
+            'tree/build/xnu/fileset-reference/*/*-build.log' \
+            'tree/build/xnu/fileset-reference/*/native-stubs.c' \
+            'tree/build/xnu/fileset-reference/*/omitted-unavailable-forced-exports.json'
       - name: logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: logs
           retention-days: 3
-          path: |
-            ${{ env.WORK }}/logs/*.log
-            ${{ env.WORK }}/tree/build/xnu/fileset-reference/*/*-build.log
-            ${{ env.WORK }}/tree/build/xnu/fileset-reference/*/native-stubs.c
-            ${{ env.WORK }}/tree/build/xnu/fileset-reference/*/omitted-unavailable-forced-exports.json
-      - name: prelink inputs
+          if-no-files-found: ignore
+          path: ${{ env.SEALED }}/logs/
+      - name: seal prelink inputs
         # A failed prelink can be rerun offline with emit_prelink.py (as aston).
         if: failure()
-        uses: actions/upload-artifact@v4
+        env:
+          SEAL_ALLOW_MISSING: "1"
+        run: |
+          bash UniXNU-xueying/scripts/opoios-ci-seal.sh prelink-inputs "$WORK" "$SEALED/prelink-inputs" \
+            'tree/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped.noctf' \
+            'tree/build/xnu/fileset-reference/mach.release.bcm2837.unstripped.noctf' \
+            'kernel/.prelink-*/*.json'
+      - name: prelink inputs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: prelink-inputs
           retention-days: 3
-          include-hidden-files: true
-          path: |
-            ${{ env.WORK }}/tree/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped.noctf
-            ${{ env.WORK }}/tree/build/xnu/fileset-reference/mach.release.bcm2837.unstripped.noctf
-            ${{ env.WORK }}/kernel/.prelink-*/*.json
+          if-no-files-found: ignore
+          path: ${{ env.SEALED }}/prelink-inputs/
+      - name: seal kernel image and release reference
+        # OPOIOS: the RELEASE LTO comparison kernel the prelink matching reads; the Linux toolchain has no libLTO to build it.
+        # It follows the XNU source, patches and kernel config, not the board archives, so a PC build can reuse it while only
+        # board code changes. With it: this run's native DEVELOPMENT kernel and matcher maps, to check the PC's matching.
+        run: |
+          bash UniXNU-xueying/scripts/opoios-ci-seal.sh xueying-ios27-kernel "$WORK" "$SEALED/kernel" \
+            'kernel/kernel.macho' 'kernel/*.json'
+          bash UniXNU-xueying/scripts/opoios-ci-seal.sh xueying-ios27-reference "$WORK" "$SEALED/reference" \
+            'tree/build/xnu/fileset-reference/mach.release.bcm2837.unstripped.noctf' \
+            'tree/build/xnu/fileset-reference/mach.release.bcm2837.unstripped.json' \
+            'tree/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped.noctf' \
+            'kernel/.prelink-*/*.json'
+          {
+            echo "### kernel (sealed)"
+            echo '```'
+            shasum -a 256 "$WORK/kernel/kernel.macho" | sed "s#  .*#  kernel.macho#"
+            echo '```'
+            echo "Open on the PC: \`bash scripts/ci-artifact.sh fetch ${{ github.run_id }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: kernel image
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: xueying-ios27-kernel
           retention-days: 3
           if-no-files-found: error
-          path: |
-            ${{ env.WORK }}/kernel/kernel.macho
-            ${{ env.WORK }}/kernel/*.json
+          path: ${{ env.SEALED }}/kernel/
       - name: release reference
-        # OPOIOS: the RELEASE LTO comparison kernel the prelink matching reads; the Linux toolchain has no libLTO to build it.
-        # It follows the XNU source, patches and kernel config, not the board archives, so a PC build can reuse it while only
-        # board code changes. With it: this run's native DEVELOPMENT kernel and matcher maps, to check the PC's matching.
-        # 7 days: the free plan's artifact storage is small.
-        uses: actions/upload-artifact@v4
+        # 7 days: long enough for PC builds against it between CI runs.
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: xueying-ios27-reference
           retention-days: 7
           if-no-files-found: error
-          include-hidden-files: true
-          path: |
-            ${{ env.WORK }}/tree/build/xnu/fileset-reference/mach.release.bcm2837.unstripped.noctf
-            ${{ env.WORK }}/tree/build/xnu/fileset-reference/mach.release.bcm2837.unstripped.json
-            ${{ env.WORK }}/tree/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped.noctf
-            ${{ env.WORK }}/kernel/.prelink-*/*.json
+          path: ${{ env.SEALED }}/reference/
