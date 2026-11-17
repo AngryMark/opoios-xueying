@@ -13,8 +13,11 @@ name: opoios-kernel
 # - nothing derived from Apple software leaves the runner in the clear: the kernel, the reference kernels, the prelink maps
 #   and the build logs are sealed by scripts/opoios-ci-seal.sh to the owner's public key ci/opoios-artifact-recipient.pem
 #   (as OddlyLabs/unixnu-fuxi seals its boot image); only the owner's PC can open them (OPOIOS scripts/ci-artifact.sh);
-# - no actions/cache: a cache of the default branch can be restored by pull-request workflows, and it would hold IPSW
-#   members (Apple files). The IPSW components come from Apple's CDN on every run;
+# - caches (IPSW members, the RELEASE reference) only while pull requests are disabled in this repository: a cache of the
+#   default branch can be restored by pull-request workflows. The "cache guard" step asks the API every run; with pull
+#   requests enabled the run builds without caches. The reference is reused only when UniXNU's own record
+#   (build-fileset-release-reference.py: XNU source tree, SDK, archives, versions, compiler, XNU_* environment, script and
+#   the file's SHA-256) matches this build exactly; otherwise it is rebuilt;
 # - manual start only, and only in the owner's repository (forks run nothing); actions pinned to commit SHAs; checkouts
 #   keep no credentials; the GITHUB_TOKEN can only read.
 #
@@ -140,6 +143,41 @@ jobs:
             for p in "$d"*.patch; do echo "apply $p in $path"; git -C "$path" apply "$(pwd)/$p"; done
           done
           cp ../UniXNU-xueying/scripts/fileset-24A446-d94ap-symbols.json kits/XnuPrelink/fixtures/
+      - name: cache guard
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The caches hold IPSW members (Apple files) and the RELEASE reference. Pull-request workflows can restore a
+          # default-branch cache, so caches are used only while this repository has pull requests disabled.
+          prs=$(gh api "repos/$GITHUB_REPOSITORY" --jq .has_pull_requests)
+          if [ "$prs" = false ]; then
+            echo "use=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::pull requests are not disabled (has_pull_requests=$prs): building without caches"
+            echo "use=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        # The IPSW components (kernelcache, device tree, trust caches, restore ramdisk; about 270 MB from Apple's CDN) and the
+        # source feeds. They follow the IPSW and feed pins only.
+        if: steps.guard.outputs.use == 'true'
+        with:
+          path: |
+            UniXNU/out/ipsw
+            UniXNU/out/feeds
+          key: opoios-inputs-${{ hashFiles('UniXNU-xueying/unixnu.lock', 'UniXNU-xueying/feeds.toml', 'UniXNU-xueying/unixnu-patches/0001-ios-27.0.1-24A446-iphone17-2.patch') }}
+      - name: restore the RELEASE reference
+        # The newest saved reference. UniXNU decides whether it fits: build-fileset-release-reference.py reuses it only when its
+        # record's inputs and SHA-256 match this build, and rebuilds it otherwise. unixnu keeps tree/build between steps.
+        id: reference
+        if: steps.guard.outputs.use == 'true'
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ${{ env.WORK }}/tree/build/xnu/fileset-reference/mach.release.bcm2837.unstripped.noctf
+            ${{ env.WORK }}/tree/build/xnu/fileset-reference/mach.release.bcm2837.unstripped.json
+          key: opoios-reference-v1-latest
+          restore-keys: opoios-reference-v1-
       - name: kernel
         working-directory: UniXNU
         env:
@@ -152,6 +190,28 @@ jobs:
           ./unixnu fetch -D ../UniXNU-xueying
           ./unixnu ipsw fetch -D ../UniXNU-xueying
           ./unixnu build kernel -D ../UniXNU-xueying
+      - name: RELEASE reference record
+        id: refkey
+        if: steps.guard.outputs.use == 'true'
+        run: |
+          dir="$WORK/tree/build/xnu/fileset-reference"
+          record="$dir/mach.release.bcm2837.unstripped.json"
+          [ -f "$record" ] || { echo "::warning::no reference record"; exit 0; }
+          # The key is the record itself: its inputs and the reference's SHA-256.
+          echo "key=opoios-reference-v1-$(shasum -a 256 "$record" | cut -c1-32)" >> "$GITHUB_OUTPUT"
+          if [ -n "$(find "$dir" -mindepth 1 -maxdepth 1 -type d -name 'lto-*' -print -quit)" ]; then
+            echo "RELEASE reference: rebuilt this run" | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "RELEASE reference: reused from the cache (UniXNU's record matched)" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: save the RELEASE reference
+        if: steps.guard.outputs.use == 'true' && steps.refkey.outputs.key != '' && steps.refkey.outputs.key != steps.reference.outputs.cache-matched-key
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ${{ env.WORK }}/tree/build/xnu/fileset-reference/mach.release.bcm2837.unstripped.noctf
+            ${{ env.WORK }}/tree/build/xnu/fileset-reference/mach.release.bcm2837.unstripped.json
+          key: ${{ steps.refkey.outputs.key }}
 
       # Everything below seals first and uploads only the sealed directory (*.tar.gz.enc, *.key.enc, *.sha256).
       - name: seal logs
