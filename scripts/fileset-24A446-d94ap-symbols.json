@@ -1214,6 +1214,118 @@
       "original_sha256": "ff6019f657439cb0e360d109cec02357535b11cbf1fbd7cf8a4518f462d21a3d",
       "native_symbol": "_SecureDTLookupEntry",
       "evidence": "Returns kError until DTInitialized, then walks the path components of pathName from searchPoint or DTRootNode. Source: pexpert/gen/device_tree.c:452. Paired by UniXNU XnuPrelink in OPOIOS CI run 43743370810 (native kernel built with Xcode 26.6) through its callers' device-tree data (data-users). A native kernel built with the Linux clang-24 toolchain keeps about 19000 fewer local symbols (no .cold splits or OUTLINED_FUNCTION copies), the data pairing then misses this function, and AppleMobileFileIntegrity, sandbox, Image4, AppleImage4 and AppleARMWatchdogTimer would reach the unmapped stub. Size and digest computed with fileset_match's own function bounds on kernelcache fa07057b. Added by OPOIOS 2026-11-15."
+    },
+    {
+      "original": "0xfffffff00ae27f5c",
+      "original_size": 708,
+      "original_sha256": "02d85c4f0ed6879f82406ac17f5903d942a97f948fcc6682427d6750b2b676d6",
+      "native_symbol": "_ifnet_dequeue_service_class",
+      "evidence": "Rejects a NULL ifp or mbuf pointer (EINVAL), then validates the service class against the MBUF_SC_* values 0x28011f/0x380120/0x38012f/0x280120/0x300110 before dequeueing one packet of that class. First of the four dequeue variants that follow ifnet_dequeue, in kpi_interface.c order. Native has the same constants and checks; only the ifnet field offsets differ. IONetworkingFamily calls it in IOOutputQueue's pull path between ifnet_stat_increment_out and mbuf_pkthdr_len."
+    },
+    {
+      "original": "0xfffffff00ae28220",
+      "original_size": 524,
+      "original_sha256": "a0dc433b6ce8f0b0c4bd26c1debfe5283819baf1a18c5db0f85d77e195833cc0",
+      "native_symbol": "_ifnet_dequeue_multi",
+      "evidence": "(ifp, pkt_limit, head, tail, cnt, len): EINVAL for a zero limit or NULL ifp/head, requires IFEF_TXSTART (eflags bit 7, original +212 / native +208) and a valid output scheduling model (original +1104 / native +848). Second dequeue variant after ifnet_dequeue in kpi_interface.c order; identical body shape to the native function."
+    },
+    {
+      "original": "0xfffffff00ae2842c",
+      "original_size": 524,
+      "original_sha256": "411999d3bcacc06fd1173f04dcd502301ee720819b54119a29cfa39e3be0503f",
+      "native_symbol": "_ifnet_dequeue_multi_bytes",
+      "evidence": "Same checks as ifnet_dequeue_multi (zero limit, NULL ifp/head, IFEF_TXSTART, scheduling model) with a byte limit instead of a packet limit. Third dequeue variant in kpi_interface.c order; identical body shape to the native function."
+    },
+    {
+      "original": "0xfffffff00ae28638",
+      "original_size": 736,
+      "original_sha256": "ff81fd979f4ca7e17bd63de2164af84ad4de6b54ec63f59eed9bc7913ec905e0",
+      "native_symbol": "_ifnet_dequeue_service_class_multi",
+      "evidence": "(ifp, sc, pkt_limit, head, tail, cnt, len): EINVAL for a zero limit or NULL ifp/head, then the same MBUF_SC_* checks as ifnet_dequeue_service_class. Last dequeue variant in kpi_interface.c order; same constants as the native function."
+    },
+    {
+      "original": "0xfffffff00ae37c80",
+      "original_size": 260,
+      "original_sha256": "1e2ca024addbfb300383ebd214ddc298303bfefac7132efffc46ad44a3db80ce",
+      "native_symbol": "_ether_del_proto",
+      "evidence": "Reads the ether descriptor block from ifp->if_family_cookie (original +840 / native +584), walks its entries from the end and clears the one whose protocol family matches w1. Directly precedes ether_add_proto in ether_if_module.c. IOEthernetInterface passes it as the del_proto callback in ifnet_init_eparams, so it has no direct call sites."
+    },
+    {
+      "original": "0xfffffff00ae389e0",
+      "original_size": 68,
+      "original_sha256": "1448d43eebcb1eb500943876c4da31276f3361e4001f807e8e9ab4e97684e4d4",
+      "native_symbol": "_ether_frameout",
+      "evidence": "Bounds checks on the frame type and destination link address pointers (x3, x4), then branches straight into ether_frameout_extended at 0xfffffff00ae38a24. Native ether_frameout is the same tail branch without the checks. IOEthernetInterface passes it as the framer callback."
+    },
+    {
+      "original": "0xfffffff00ae38cac",
+      "original_size": 88,
+      "original_sha256": "07d0195009b7c5c67d87a42de46c668446d2d4dc8ddf860620da839dc8f87d3d",
+      "native_symbol": "_ether_check_multi",
+      "evidence": "Accepts AF_UNSPEC or AF_LINK (0x12) sockaddrs, returns EADDRNOTAVAIL (49) unless the first address byte has the multicast bit, EAFNOSUPPORT (47) otherwise. Byte-for-byte the native logic; it sits between ether_frameout_extended and ether_ioctl. IOEthernetInterface passes it as the check_multi callback."
+    },
+    {
+      "original": "0xfffffff00ae77d28",
+      "original_size": 32,
+      "original_sha256": "5ace3d711537746932f4ecd9ec5eda3ae446acd0527cfce1a6cabd65a7ba91e5",
+      "native_symbol": "_ifnet_set_mtu",
+      "evidence": "NULL check (EINVAL), then stores w1 to if_mtu at +256 and returns 0. Native stores to +248; the iOS 27 struct ifnet has 8 more bytes before this field. Followed by ifnet_mtu (reads +256) and ifnet_type (reads byte +248), matching kpi_interface.c order. IONetworkingFamily calls it before ifnet_set_flags with the interface MTU (1500 on the OnePlus Open NCM run, which panicked here as unmapped on 2026-11-17)."
+    },
+    {
+      "original": "0xfffffff00ae77d48",
+      "original_size": 16,
+      "original_sha256": "ade3444a7be38deccecdce7a96ca330a5accf1dd4e4dedc9a6d48c678e49bc2e",
+      "native_symbol": "_ifnet_mtu",
+      "evidence": "NULL check, then returns the 32-bit if_mtu at +256 (native +248). Directly follows ifnet_set_mtu."
+    },
+    {
+      "original": "0xfffffff00ae77d68",
+      "original_size": 32,
+      "original_sha256": "01853cd7659510177e4442c656dbdeab51e9e05376e1a9b5da17715198a988bc",
+      "native_symbol": "_ifnet_set_addrlen",
+      "evidence": "NULL check (EINVAL), stores byte w1 to if_addrlen at +251 (native +243), returns 0. Follows ifnet_type, as in kpi_interface.c. IONetworkingFamily calls it after ifnet_set_flags when it configures the interface."
+    },
+    {
+      "original": "0xfffffff00ae77d88",
+      "original_size": 16,
+      "original_sha256": "e8bae2b9dcf2ea07f3c74639e96c7ee69c075a1925a7410dd1f2b754f0ffdd24",
+      "native_symbol": "_ifnet_addrlen",
+      "evidence": "NULL check, then returns the byte if_addrlen at +251 (native +243). Directly follows ifnet_set_addrlen."
+    },
+    {
+      "original": "0xfffffff00ae77d98",
+      "original_size": 32,
+      "original_sha256": "27ea449f992ed634c6c6bffaf3ca1aca7fbf6973b2f3b0c2e02d4807eb73dac6",
+      "native_symbol": "_ifnet_set_hdrlen",
+      "evidence": "NULL check (EINVAL), stores byte w1 to if_hdrlen at +252 (native +244), returns 0. Follows ifnet_addrlen. IONetworkingFamily calls it after ifnet_set_addrlen and before ifnet_set_rcvq_maxlen and ifnet_attach."
+    },
+    {
+      "original": "0xfffffff00ae77db8",
+      "original_size": 16,
+      "original_sha256": "e37d5a15dee5750ce2254bf8715a2f7bc584f847db6999142d73c5171f60be41",
+      "native_symbol": "_ifnet_hdrlen",
+      "evidence": "NULL check, then returns the byte if_hdrlen at +252 (native +244). Directly follows ifnet_set_hdrlen and precedes ifnet_set_metric (stores +260, native +252)."
+    },
+    {
+      "original": "0xfffffff00ae77df8",
+      "original_size": 60,
+      "original_sha256": "998aff227462c3e96c29e37738dc8527ad91a0011808ebe3a7f430a757b2ecbd",
+      "native_symbol": "_ifnet_set_baudrate",
+      "evidence": "NULL check, then stores x1 to the four input/output bandwidth fields (original +1112/+1120/+1128/+1136, native +856/+864/+872/+880) and the 32-bit clamped copy to if_baudrate (original +264, native +256). Same store order and clamp as the native function. IONetworkingFamily calls it before bpfattach."
+    },
+    {
+      "original": "0xfffffff00b1157d4",
+      "original_size": 52,
+      "original_sha256": "737bc907804bce1eb7345f6faa0a34cb8864d573710166617347eda2ac310d25",
+      "native_symbol": "_mbuf_data_to_physical",
+      "evidence": "Translates a data pointer to a physical address through a helper with an out parameter and returns 0 on failure. Sits after mbuf_maxlen and directly before mbuf_get (whose body is *mbuf = m_get(how, type), ENOMEM on NULL), as in kpi_mbuf.c. IONetworkingFamily calls it between mbuf_data and mbuf_len when it builds DMA segments."
+    },
+    {
+      "original": "0xfffffff00b116ae8",
+      "original_size": 284,
+      "original_sha256": "e1ace11fb280320c1200ec99623fa33523949e3cd790465c0d2a057e0c7aa2c0",
+      "native_symbol": "_mbuf_add_drvaux",
+      "evidence": "(mbuf, how, family, subfamily, length, data_p): EINVAL unless 1 <= length <= 0xe8 and M_PKTHDR; EEXIST if m_tag_locate(m, 0, 9) finds a driver aux tag; otherwise m_tag_create with length + 16 and stores family, subfamily and length in the header. Native has the same constants. Directly precedes mbuf_find_drvaux and mbuf_del_drvaux."
     }
   ],
   "data": [
