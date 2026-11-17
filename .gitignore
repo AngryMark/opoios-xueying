@@ -52,6 +52,8 @@ firmware/wcn7850/*.bin
 *.mbn
 *.fw
 *.pem
+# The owner's PUBLIC key for sealed CI artifacts (ci/README.md); private keys never belong here.
+!ci/opoios-artifact-recipient.pem
 *.key
 .env
 local.toml
