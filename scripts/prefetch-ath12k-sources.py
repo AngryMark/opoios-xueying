@@ -35,6 +35,13 @@ def main():
         git('-C', str(directory), 'read-tree', '-mu', 'HEAD')
         head = subprocess.run(['git', '-C', str(directory), 'rev-parse', 'HEAD'], check=True, capture_output=True, text=True).stdout.strip()
         if head != source['commit']:
+            # A release branch moves after the lock (FreeBSD's releng/15.1 got a commit on 2026-11-17). Fetch the locked commit
+            # itself and check it out; the module's own check wants HEAD to be exactly that commit.
+            print(f'{name}: {source["ref"]} moved to {head}; fetching the locked {source["commit"]}')
+            git('-C', str(directory), 'fetch', '--depth', '1', '--filter=blob:none', 'origin', source['commit'])
+            git('-C', str(directory), 'checkout', '--detach', source['commit'])
+            head = subprocess.run(['git', '-C', str(directory), 'rev-parse', 'HEAD'], check=True, capture_output=True, text=True).stdout.strip()
+        if head != source['commit']:
             raise SystemExit(f'{name}: {source["ref"]} is {head}, the lock expects {source["commit"]}')
         missing = [path for path in source['required'] if not (directory / path).is_file()]
         if missing:
