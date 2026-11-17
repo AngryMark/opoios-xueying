@@ -3,6 +3,8 @@
 #
 #   bash scripts/opoios-ci-seal.sh <name> <base-dir> <out-dir> <path-or-glob relative to base-dir>...
 #
+# A pattern that starts with ? is optional (e.g. the prelink maps, which a successful build may not keep).
+#
 # The repository is public, so every artifact can be downloaded by anyone signed in to GitHub. The kernel (kernel.macho, the
 # prelinked iPhone17,2 kernelcache's kexts), the reference kernels, the prelink maps and the build logs therefore go out only
 # inside <name>.tar.gz.enc, encrypted to the owner's RSA key, the way OddlyLabs/unixnu-fuxi seals its boot image
@@ -29,13 +31,15 @@ list=$stage/members
   cd "$base"
   shopt -s nullglob dotglob
   for pattern in "$@"; do
+    optional=0
+    case $pattern in \?*) optional=1; pattern=${pattern#\?} ;; esac
     matched=0
     for f in $pattern; do
       [ -f "$f" ] || continue
       printf '%s\n' "$f" >> "$list"; matched=1
     done
     if [ "$matched" = 0 ]; then
-      if [ "${SEAL_ALLOW_MISSING:-0}" = 1 ]; then echo "::warning::$name: nothing matches $pattern"
+      if [ "$optional" = 1 ] || [ "${SEAL_ALLOW_MISSING:-0}" = 1 ]; then echo "::warning::$name: nothing matches $pattern"
       else echo "::error::$name: nothing matches $pattern"; exit 1; fi
     fi
   done

@@ -201,7 +201,7 @@ jobs:
             'tree/build/xnu/fileset-reference/mach.release.bcm2837.unstripped.noctf' \
             'tree/build/xnu/fileset-reference/mach.release.bcm2837.unstripped.json' \
             'tree/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped.noctf' \
-            'kernel/.prelink-*/*.json'
+            '?kernel/.prelink-*/*.json'
           {
             echo "### kernel (sealed)"
             echo '```'
