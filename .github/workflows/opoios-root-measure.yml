@@ -1,0 +1,125 @@
+name: opoios-root-measure
+
+# OPOIOS stage 4 (the RAM budget, docs/06-stage4-ram-budget.md in the OPOIOS project): how much of the iPhone17,2 24A446 root a
+# RAM disk would have to hold. Takes the OS and Cryptex1,SystemOS disk images of the pinned IPSW (Apple's CDN, by HTTP ranges,
+# through UniXNU's own ipsw code), decrypts them (macOS aea, key fetched by ipsw), checks them against the [root] image sha256
+# of the iOS 27 profile, and measures them with scripts/opoios-measure-root.py: nonzero 4 KiB and 16 KiB pages, APFS used
+# capacity, space per directory and the largest files.
+#
+# Public repository (OPOIOS docs/05-public-ci.md): the images never leave the runner and are not cached. The report holds sizes
+# and path names only; it is still sealed to the owner's key like every other output (scripts/opoios-ci-seal.sh), and the job
+# summary shows the totals. Manual start only, only in the owner's repository; actions pinned to commit SHAs; checkouts keep
+# no credentials; the GITHUB_TOKEN can only read. No phone, no kernel, no firmware involved.
+#
+# Run: gh workflow run opoios-root-measure.yml -R <owner>/<repo> --ref xueying
+#      then, on the PC (WSL): bash scripts/ci-artifact.sh fetch <run-id> xueying-root-measure   (OPOIOS project)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: opoios-root-measure
+  cancel-in-progress: true
+
+jobs:
+  measure:
+    if: github.repository_owner == 'AngryMark'
+    runs-on: macos-26
+    timeout-minutes: 120
+    env:
+      SEALED: ${{ github.workspace }}/sealed
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: UniXNU-xueying
+          persist-credentials: false
+      - name: recipient key
+        run: |
+          [ -s UniXNU-xueying/ci/opoios-artifact-recipient.pem ] || { echo "::error::ci/opoios-artifact-recipient.pem is missing"; exit 1; }
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: UniXNU/UniXNU
+          # The pin of opoios-kernel.yml. Only its scripts/unixnu (the IPSW reader) and the iOS 27 profile are used here.
+          ref: 00f47f6875749dec49bb782718dff1de28006856
+          path: UniXNU
+          submodules: false
+          persist-credentials: false
+      - name: iOS 27 profile
+        # unixnu-patches/ adds profiles/os/ios-27.0.1-24A446 ([ipsw] pin, [root] image digests) to the pinned checkout.
+        working-directory: UniXNU
+        run: for p in ../UniXNU-xueying/unixnu-patches/*.patch; do echo "apply $p"; git apply "$p"; done
+      - name: tools
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for attempt in 1 2 3; do
+            brew install openssl@3 blacktop/tap/ipsw && break
+            echo "::warning::brew install failed (attempt $attempt)"; sleep 45
+          done
+          if ! command -v ipsw >/dev/null; then
+            dir="$RUNNER_TEMP/ipsw"; archive=ipsw_3.1.743_macOS_arm64_extras.tar.gz
+            gh release download v3.1.743 -R blacktop/ipsw -p "$archive" -D "$dir"
+            echo "c7da3f9fba1901a608e81d06269f4050f60a5b55ebf7418535336bb9c8810eba  $dir/$archive" | shasum -a 256 -c -
+            tar -xzf "$dir/$archive" -C "$dir"
+            echo "$dir" >> "$GITHUB_PATH"; export PATH="$dir:$PATH"
+          fi
+          echo "OPENSSL=$(brew --prefix openssl@3)/bin/openssl" >> "$GITHUB_ENV"
+          command -v ipsw && [ -x /usr/bin/aea ] && [ -x "$(brew --prefix openssl@3)/bin/openssl" ]
+          df -h "$GITHUB_WORKSPACE"
+      - name: fetch and decrypt OS and SystemOS
+        run: |
+          python3 - <<'PY'
+          import json, os, sys, tomllib, types
+          from pathlib import Path
+          sys.path.insert(0, 'UniXNU/scripts')
+          from unixnu import ipsw
+          profile = tomllib.loads(Path('UniXNU/profiles/os/ios-27.0.1-24A446/profile.toml').read_text())
+          ctx = types.SimpleNamespace(board={'ipsw': profile['ipsw']}, option_text=lambda *names: None,
+                                      out_root=Path('images').resolve())
+          source = ipsw.Ipsw(ctx)
+          wanted = {'OS': profile['root']['os_image_sha256'], 'Cryptex1,SystemOS': profile['root']['systemos_image_sha256']}
+          listing = []
+          for component, digest in wanted.items():
+              name, size, _ = source.info(component)
+              print(f'{component}: {name}, {size} bytes in the IPSW', flush=True)
+              plain = source.disk_image(component)
+              record = json.loads(plain.with_suffix(plain.suffix + '.json').read_text())
+              if record.get('sha256') != digest:
+                  sys.exit(f'{component}: decrypted image sha256 {record.get("sha256")} is not the profile\'s {digest}')
+              print(f'{component}: {plain.name}, {plain.stat().st_size} bytes, sha256 matches the profile', flush=True)
+              archive = plain.with_name(plain.name + '.aea')
+              if archive.exists():
+                  archive.unlink()  # the archive is not needed any more; keep the disk for the next one
+              listing.append(f'{"SystemOS" if component != "OS" else "OS"}={plain}')
+          Path('images/list').write_text('\n'.join(listing) + '\n')
+          PY
+          df -h "$GITHUB_WORKSPACE"
+      - name: measure
+        run: |
+          python3 UniXNU-xueying/scripts/opoios-measure-root.py --out report $(cat images/list)
+          {
+            echo "### iPhone17,2 24A446 root (OS + Cryptex1,SystemOS)"
+            echo
+            cat report/summary.md
+            echo
+            echo "Full report (sizes and paths), sealed: \`bash scripts/ci-artifact.sh fetch $GITHUB_RUN_ID xueying-root-measure\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: seal report
+        if: always()
+        env:
+          SEAL_ALLOW_MISSING: "1"
+        run: bash UniXNU-xueying/scripts/opoios-ci-seal.sh xueying-root-measure "$GITHUB_WORKSPACE/report" "$SEALED/report" 'report.txt' 'summary.md'
+      - name: report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: xueying-root-measure
+          retention-days: 7
+          if-no-files-found: ignore
+          path: ${{ env.SEALED }}/report/
+      - name: clean up
+        if: always()
+        run: rm -rf images report
