@@ -79,6 +79,12 @@ roots = [
   # unregistered") and never goes on the bus (phone run 2026-11-16 05:41 UTC). Adds com.apple.driver.usb.networking and
   # com.apple.iokit.IONetworkingFamily as its libraries.
   "com.apple.driver.AppleUSBDeviceNCM",
+  # OPOIOS: com.apple.iokit.IONetworkingFamily is a root for its IONetworkStack personality. As a mere library of the NCM
+  # driver its personalities were dropped, so IONetworkStack never existed. AppleUSBDeviceNCM11Data::start names its interface
+  # through usb.networking nameBSDInterface, which calls waitForService(IONetworkStack) with no timeout, so start never
+  # returned, the AppleUSBNCMDataAux nub stayed busy, and restored_external sat in enable_usb (IOServiceWaitQuiet) with
+  # nobody accepting on port 62078 (phone runs 2026-11-16 21:50 and 22:06 UTC, BUSY report).
+  "com.apple.iokit.IONetworkingFamily",
   "com.apple.iokit.IOUSBHostFamily", "com.apple.driver.usb.AppleUSBXHCI", "com.apple.driver.usb.AppleUSBHub",
   "com.apple.driver.usb.AppleUSBHostCompositeDevice", "com.apple.driver.usb.IOUSBHostHIDDevice", "com.apple.iokit.IOUSBMassStorageDriver",
   "com.apple.iokit.IOSCSIArchitectureModelFamily", "com.apple.iokit.IOSCSIBlockCommandsDevice",
