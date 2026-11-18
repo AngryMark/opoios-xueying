@@ -1,0 +1,45 @@
+--- a/scripts/seed-data-grow.py
++++ b/scripts/seed-data-grow.py
+@@ -21,6 +21,7 @@
+ import subprocess
+ import sys
+ import tempfile
++import time
+ from pathlib import Path
+ 
+ ROOT = Path(__file__).resolve().parents[1]
+@@ -106,14 +107,28 @@
+         attached = run('hdiutil', 'attach', '-imagekey', 'diskimage-class=CRawDiskImage', '-nomount', '-nobrowse', str(raw))
+         store = re.match(r'(/dev/disk\d+)', attached).group(1).split('/')[-1]
+         try:
+-            listing = plistlib.loads(subprocess.check_output(['diskutil', 'apfs', 'list', '-plist']))
++            # OPOIOS: on GitHub's macOS runners the container of a just attached image is not always listed yet ("No APFS
++            # container found on the attached seed": marble's macOS 15 run, OPOIOS run 44384065541). Wait for it, and else
++            # hand diskutil the physical store, which resizeContainer also takes.
+             container = None
+-            for entry in listing['Containers']:
+-                if any(s['DeviceIdentifier'] == store for s in entry.get('PhysicalStores', [])):
+-                    container = entry['ContainerReference']
++            for _ in range(30):
++                listing = plistlib.loads(subprocess.check_output(['diskutil', 'apfs', 'list', '-plist']))
++                for entry in listing['Containers']:
++                    if any(s['DeviceIdentifier'] == store for s in entry.get('PhysicalStores', [])):
++                        container = entry['ContainerReference']
++                if container:
++                    break
++                time.sleep(1)
+             if not container:
+-                sys.exit('No APFS container found on the attached seed')
+-            run('diskutil', 'apfs', 'resizeContainer', container, '0')
++                print(f'seed-data-grow: no APFS container listed for {store}; resizing through the physical store',
++                      file=sys.stderr)
++                print(subprocess.run(['diskutil', 'list', store], capture_output=True, text=True).stdout, file=sys.stderr)
++            try:
++                run('diskutil', 'apfs', 'resizeContainer', container or store, '0')
++            except subprocess.CalledProcessError as error:
++                print('seed-data-grow: diskutil apfs resizeContainer failed:', file=sys.stderr)
++                print(error.stdout, error.stderr, file=sys.stderr)
++                raise
+         finally:
+             subprocess.run(['hdiutil', 'detach', store, '-force'], capture_output=True)
+         header = raw.open('rb').read(4096)
