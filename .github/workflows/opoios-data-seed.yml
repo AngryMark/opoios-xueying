@@ -117,7 +117,9 @@ jobs:
         run: |
           case $GIB in ''|*[!0-9]*) echo "::error::gib must be a number"; exit 1 ;; esac
           [ "$GIB" -ge 3 ] && [ "$GIB" -le 64 ] || { echo "::error::gib must be in 3..64"; exit 1; }
-          mkdir -p seed os-mount
+          # seed-data-grow.py (called by make-data-seed.py) keeps its scratch image in UniXNU/build, which only a kernel build
+          # creates (run 44382325710 stopped there).
+          mkdir -p seed os-mount UniXNU/build
           attached=$(hdiutil attach -readonly -nobrowse -mountpoint "$PWD/os-mount" -plist "$(cat images/os)")
           device=$(printf '%s' "$attached" | python3 -c 'import plistlib,sys; print(plistlib.loads(sys.stdin.buffer.read())["system-entities"][0]["dev-entry"])')
           [ -f os-mount/sbin/launchd ] || { echo "::error::not the OS volume"; hdiutil detach "$device"; exit 1; }
