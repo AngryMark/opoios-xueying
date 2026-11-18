@@ -2,10 +2,11 @@
 // OPOIOS: the RAM root store's windows (OS, SystemOS) as read-only block devices (stage 4 path 1, step 5).
 //
 // UEFI leaves the store in reserved RAM above the XNU window and a descriptor at the start of that region (see
-// OpoiosRootStore.h). opoios_root_store_start() (SourceStorage.cpp, opoios-ram-root=2) maps the descriptor page, then the
-// store's extents as one read-only, cacheable (copyback) kernel mapping, authenticates every window's VerifiedRoot envelope
-// with the key compiled into this kernel (verified_root_key, the policy anchor) and starts one OpoiosRootStoreDisk per
-// window under the platform root. The original IOBlockStorageDriver then publishes IOMedia, APFS its container and
+// OpoiosRootStore.h). opoios_root_store_start() (SourceStorage.cpp, opoios-ram-root=2) maps the descriptor page, sets up
+// ors_phys over the store's extents (pinned read-only copyback views of the header, envelopes and chunk tables, and LRU
+// mapping windows of opoios-store-window-mib, 64 MiB, for the chunk data: the kernel did not map the whole store at once,
+// run store1), authenticates every window's VerifiedRoot envelope with the key compiled into this kernel
+// (verified_root_key, the policy anchor) and starts one OpoiosRootStoreDisk per window under the platform root. The original IOBlockStorageDriver then publishes IOMedia, APFS its container and
 // volumes. Every block a disk returns has been checked against its signed hash; a dropped or damaged block fails the
 // request with an I/O error. SourceRootBinding.cpp asks opoios_root_store_authenticates() which media a disk vouches for.
 //
@@ -25,13 +26,17 @@ extern "C" {
 extern const struct vr_crypto vr_xnu_crypto;
 extern const uint8_t verified_root_key[];
 
-// Lock-free state for SourceStorage.cpp's report rows. stage: 1 descriptor page mapped, 2 descriptor valid, 3 store mapped,
-// 4 windows authenticated, 5 reader ready, 6 disks started; the negative of the step that failed. error: the ors_status
-// or IOReturn of that failure.
+// Lock-free state for SourceStorage.cpp's report rows. stage: 1 descriptor page mapped, 2 descriptor valid, 3 store access
+// ready, 4 windows authenticated, 5 reader ready, 6 disks started; the negative of the step that failed. error: the
+// ors_status (8 = a mapping failed) or the index of the failing disk. probe: which single mappings the kernel gave, tried
+// once and released at once (bit 0 the whole store over both extents, as run store1 failed; bit 1 the first extent
+// alone; bit 2 1 GiB; bit 3 64 MiB). maps/map failures: the access layer's mappings so far.
 volatile int32_t opoios_store_stage = 0;
 volatile int32_t opoios_store_error = 0;
 volatile uint64_t opoios_store_bytes = 0;
 volatile uint32_t opoios_store_disks = 0;
+volatile uint32_t opoios_store_probe = 0;
+volatile uint64_t opoios_store_maps = 0, opoios_store_map_failures = 0;
 volatile uint64_t opoios_store_requests = 0, opoios_store_request_bytes = 0, opoios_store_failures = 0;
 volatile uint64_t opoios_store_decodes = 0, opoios_store_hits = 0, opoios_store_verified = 0;
 volatile uint64_t opoios_store_dropped = 0, opoios_store_damaged = 0;
@@ -50,16 +55,51 @@ constexpr IOOptionBits kPhysicalCopyback = static_cast<IOOptionBits>(kIODirectio
 constexpr IOOptionBits kMapReadOnly = static_cast<IOOptionBits>(kIOMapAnywhere) | static_cast<IOOptionBits>(kIOMapReadOnly) |
                                       static_cast<IOOptionBits>(kIOMapCopybackCache);
 
+constexpr unsigned kDefaultWindowMiB = 64;
+
 struct StoreState {
-    IOLock *lock = nullptr;                  // serializes the reader, its cache and the bounce buffer
-    IOMemoryDescriptor *memory = nullptr;
-    IOMemoryMap *map = nullptr;
+    IOLock *lock = nullptr;                  // serializes the reader, its cache, the mapping windows and the bounce buffer
+    ors_phys phys = {};
     ors_store store = {};
     ors_reader reader = {};
     uint8_t *bounce = nullptr;
     bool ready = false;
 };
 StoreState gStore;
+
+// The platform mapper of ors_phys: one physical range, read-only, copyback (the memory is outside XNU's managed range, so
+// the device pager takes the cache mode from the descriptor). The map keeps its descriptor; the handle is the map.
+const uint8_t *mapPhysical(void *, uint64_t phys, uint64_t length, void **handle)
+{
+    IOMemoryDescriptor *memory = IOMemoryDescriptor::withAddressRange(phys, length, kPhysicalCopyback, TASK_NULL);
+    IOMemoryMap *map = memory ? memory->createMappingInTask(kernel_task, 0, kMapReadOnly) : nullptr;
+    OSSafeReleaseNULL(memory);
+    if (!map || map->getLength() < length) {
+        OSSafeReleaseNULL(map);
+        __atomic_fetch_add(&opoios_store_map_failures, 1, __ATOMIC_RELAXED);
+        return nullptr;
+    }
+    __atomic_fetch_add(&opoios_store_maps, 1, __ATOMIC_RELAXED);
+    *handle = map;
+    return reinterpret_cast<const uint8_t *>(map->getVirtualAddress());
+}
+
+void unmapPhysical(void *, void *handle)
+{
+    if (handle) static_cast<IOMemoryMap *>(handle)->release();
+}
+
+// One mapping of `count` physical ranges, made and released at once: does the kernel give this size?
+bool probeMapping(const IOAddressRange *ranges, uint32_t count)
+{
+    IOMemoryDescriptor *memory = IOMemoryDescriptor::withAddressRanges(const_cast<IOAddressRange *>(ranges), count,
+                                                                       kPhysicalCopyback, TASK_NULL);
+    IOMemoryMap *map = memory ? memory->createMappingInTask(kernel_task, 0, kMapReadOnly) : nullptr;
+    const bool ok = map != nullptr;
+    OSSafeReleaseNULL(map);
+    OSSafeReleaseNULL(memory);
+    return ok;
+}
 
 bool fail(int32_t stage, int32_t error, const char *what)
 {
@@ -230,24 +270,40 @@ extern "C" bool opoios_root_store_start(IOService *provider)
     opoios_store_bytes = d.store_bytes;
     opoios_store_stage = 2;
 
-    // 3. The store, its extents in order as one mapping.
-    IOAddressRange ranges[2] = {};
-    uint32_t count = 0;
-    uint64_t left = (d.store_bytes + ORS_BLOCK - 1) & ~static_cast<uint64_t>(ORS_BLOCK - 1);
-    for (unsigned i = 0; i < d.extent_count && left; ++i) {
-        const uint64_t take = d.extent[i].bytes < left ? d.extent[i].bytes : left;
-        ranges[count++] = {d.extent[i].base, take};
-        left -= take;
+    // 3. Access to the store: never one mapping of all of it (run store1: the 7.5 GiB mapping failed), but pinned views of
+    // its header, envelopes and tables and mapping windows for the chunk data, each inside one physical extent. First,
+    // once, which sizes the kernel maps at all (released at once; only for the report).
+    {
+        IOAddressRange ranges[2] = {};
+        uint32_t count = 0;
+        uint64_t left = (d.store_bytes + ORS_BLOCK - 1) & ~static_cast<uint64_t>(ORS_BLOCK - 1);
+        for (unsigned i = 0; i < d.extent_count && left; ++i) {
+            const uint64_t take = d.extent[i].bytes < left ? d.extent[i].bytes : left;
+            ranges[count++] = {d.extent[i].base, take};
+            left -= take;
+        }
+        uint32_t probe = 0;
+        if (!left && probeMapping(ranges, count)) probe |= 1;
+        if (probeMapping(ranges, 1)) probe |= 2;
+        IOAddressRange gib = {d.extent[0].base, d.extent[0].bytes < (1ull << 30) ? d.extent[0].bytes : (1ull << 30)};
+        if (probeMapping(&gib, 1)) probe |= 4;
+        IOAddressRange window = {d.extent[0].base, d.extent[0].bytes < (64ull << 20) ? d.extent[0].bytes : (64ull << 20)};
+        if (probeMapping(&window, 1)) probe |= 8;
+        opoios_store_probe = probe;
     }
-    if (left) return fail(3, 0, "extents shorter than the store");
-    gStore.memory = IOMemoryDescriptor::withAddressRanges(ranges, count, kPhysicalCopyback, TASK_NULL);
-    gStore.map = gStore.memory ? gStore.memory->createMappingInTask(kernel_task, 0, kMapReadOnly) : nullptr;
-    if (!gStore.map || gStore.map->getLength() < d.store_bytes) return fail(3, 0, "cannot map the store");
+    unsigned windowMiB = kDefaultWindowMiB;
+    PE_parse_boot_argn("opoios-store-window-mib", &windowMiB, sizeof(windowMiB));
+    if (windowMiB < 1) windowMiB = 1;
+    if (windowMiB > 1024) windowMiB = 1024;
+    const int access = ors_phys_init(&gStore.phys, &d, static_cast<uint64_t>(windowMiB) << 20, nullptr, mapPhysical,
+                                     unmapPhysical);
+    if (access) return fail(3, access, "store layout");
     opoios_store_stage = 3;
 
-    // 4. Every window's envelope against the compiled-in key.
-    const int opened = ors_open(&gStore.store, reinterpret_cast<const uint8_t *>(gStore.map->getVirtualAddress()),
-                                d.store_bytes, verified_root_key, &vr_xnu_crypto);
+    // 4. Every window's envelope against the compiled-in key (ors_open pins what it keeps).
+    ors_access storeAccess;
+    ors_phys_access(&gStore.phys, &storeAccess);
+    const int opened = ors_open(&gStore.store, &storeAccess, d.store_bytes, verified_root_key, &vr_xnu_crypto);
     if (opened) return fail(4, opened, ors_status_name(opened));
     opoios_store_stage = 4;
 
@@ -297,11 +353,12 @@ extern "C" bool opoios_root_store_start(IOService *provider)
 // requests/failures, chunk decodes/cache hits, blocks verified, dropped and damaged reads.
 extern "C" void opoios_root_store_row(char *out, size_t size)
 {
-    snprintf(out, size, "STORE st %d err %d bytes %llu disks %u req %llu/%lluMiB fail %llu dec %llu hit %llu ver %llu "
-             "drop %llu dmg %llu", (int)opoios_store_stage, (int)opoios_store_error, (unsigned long long)opoios_store_bytes,
-             (unsigned)opoios_store_disks, (unsigned long long)opoios_store_requests,
-             (unsigned long long)(opoios_store_request_bytes >> 20), (unsigned long long)opoios_store_failures,
-             (unsigned long long)opoios_store_decodes, (unsigned long long)opoios_store_hits,
-             (unsigned long long)opoios_store_verified, (unsigned long long)opoios_store_dropped,
-             (unsigned long long)opoios_store_damaged);
+    snprintf(out, size, "STORE st %d err %d bytes %llu probe %x maps %llu/%llu disks %u req %llu/%lluMiB fail %llu dec %llu "
+             "hit %llu ver %llu drop %llu dmg %llu", (int)opoios_store_stage, (int)opoios_store_error,
+             (unsigned long long)opoios_store_bytes, (unsigned)opoios_store_probe, (unsigned long long)opoios_store_maps,
+             (unsigned long long)opoios_store_map_failures, (unsigned)opoios_store_disks,
+             (unsigned long long)opoios_store_requests, (unsigned long long)(opoios_store_request_bytes >> 20),
+             (unsigned long long)opoios_store_failures, (unsigned long long)opoios_store_decodes,
+             (unsigned long long)opoios_store_hits, (unsigned long long)opoios_store_verified,
+             (unsigned long long)opoios_store_dropped, (unsigned long long)opoios_store_damaged);
 }

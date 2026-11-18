@@ -1,10 +1,14 @@
 /* SPDX-License-Identifier: BSD-2-Clause-Patent */
 /* Host check of OpoiosRootStore.c with VerifiedRoot's OpenSSL provider (built by scripts/check-opoios-root-store.py).
  *
- *   ors-test check STORE KEY [--slots N] [--random N] [--image NAME=PATH]...
+ *   ors-test check STORE KEY [--slots N] [--random N] [--window BYTES] [--split BYTES] [--image NAME=PATH]...
  *       open the store with the trusted anchor KEY (395 bytes); read every 4 KiB block of every window through ors_read
  *       (ok, dropped or damaged; ok blocks equal to the image when one is given); then N random reads of 512-byte
  *       aligned ranges up to 256 KiB, each of which must succeed exactly when every block it touches did.
+ *       The store is reached as the kernel reaches it, through ors_phys: two extents laid out as on the phone (the first
+ *       --split bytes at 0xA00010000, a 300 MiB hole, the rest after it; default: the phone's 0x1A012E000, or half of a
+ *       smaller store) and mapping windows of --window bytes (default 64 MiB). The mapper refuses any mapping that is
+ *       not inside one extent, as a mapping across the hole would be wrong on the phone.
  *   ors-test descriptor FILE    parse a descriptor page and print it.
  * Output: one "WINDOW" line per window and a "TOTAL" line; exit 0 only when every count agrees with the store header. */
 #include "OpoiosRootStore.h"
@@ -39,6 +43,40 @@ static uint64_t rng(void)
     return rng_state;
 }
 
+/* Fake physical memory: the two extents of a descriptor map onto consecutive parts of the store file. */
+struct fake_phys {
+    const uint8_t *store;
+    struct ors_descriptor d;
+    uint64_t live, refused;
+};
+
+static const uint8_t *fake_map(void *context, uint64_t phys, uint64_t length, void **handle)
+{
+    struct fake_phys *f = context;
+    uint64_t before = 0;
+    if ((phys & (ORS_BLOCK - 1)) || (length & (ORS_BLOCK - 1)) || !length) { ++f->refused; return NULL; }
+    for (unsigned i = 0; i < f->d.extent_count; ++i) {
+        const struct ors_extent *e = &f->d.extent[i];
+        if (phys >= e->base && phys - e->base <= e->bytes && length <= e->bytes - (phys - e->base)) {
+            /* Bytes past the store's end inside the last extent read as the file would not have them: refuse those. */
+            if (before + (phys - e->base) + length > f->d.store_bytes) { ++f->refused; return NULL; }
+            ++f->live;
+            *handle = (void *)(uintptr_t)(phys | 1);
+            return f->store + before + (phys - e->base);
+        }
+        before += e->bytes;
+    }
+    ++f->refused;
+    return NULL;
+}
+
+static void fake_unmap(void *context, void *handle)
+{
+    struct fake_phys *f = context;
+    if (!((uintptr_t)handle & 1) || !f->live) { fprintf(stderr, "bad unmap\n"); exit(3); }
+    --f->live;
+}
+
 static int descriptor(const char *path)
 {
     uint64_t bytes = 0;
@@ -65,11 +103,14 @@ int main(int argc, char **argv)
         return 2;
     }
     unsigned slots = 64, randoms = 2000;
+    uint64_t window = 64ull << 20, split = 0;
     const char *imageName[ORS_MAX_WINDOWS] = {0}, *imagePath[ORS_MAX_WINDOWS] = {0};
     unsigned images = 0;
     for (int i = 4; i < argc; ++i) {
         if (!strcmp(argv[i], "--slots") && i + 1 < argc) slots = (unsigned)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--random") && i + 1 < argc) randoms = (unsigned)strtoul(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "--window") && i + 1 < argc) window = strtoull(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "--split") && i + 1 < argc) split = strtoull(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--image") && i + 1 < argc && images < ORS_MAX_WINDOWS) {
             char *spec = argv[++i], *eq = strchr(spec, '=');
             if (!eq) return 2;
@@ -82,13 +123,26 @@ int main(int argc, char **argv)
     const uint8_t *base = map_file(argv[2], &storeBytes);
     const uint8_t *key = map_file(argv[3], &keyBytes);
     if (keyBytes != VR_KEY_BYTES) { fprintf(stderr, "key is %" PRIu64 " bytes\n", keyBytes); return 2; }
+    /* The phone's layout (run 3-2): 0xA00010000 + 0x1A012E000, the 300 MiB ABL payload, then the rest. */
+    struct fake_phys fake = {.store = base};
+    if (!split) split = storeBytes > 0x1A012E000ull ? 0x1A012E000ull : (storeBytes / 2) & ~(uint64_t)(ORS_BLOCK - 1);
+    fake.d.store_bytes = storeBytes;
+    fake.d.extent_count = 2;
+    fake.d.extent[0] = (struct ors_extent){0xA00010000ull, split};
+    /* As on the phone, the last extent runs past the store (to the region's end); ors_phys must not map that part. */
+    fake.d.extent[1] = (struct ors_extent){0xA00010000ull + split + 0x12C00000ull,
+                                           ((storeBytes - split + ORS_BLOCK - 1) & ~(uint64_t)(ORS_BLOCK - 1)) + (64u << 20)};
+    struct ors_phys phys;
+    if (ors_phys_init(&phys, &fake.d, window, &fake, fake_map, fake_unmap)) { printf("PHYS format\n"); return 1; }
+    struct ors_access access;
+    ors_phys_access(&phys, &access);
     struct ors_store store;
-    int status = ors_open(&store, base, storeBytes, key, &provider);
+    int status = ors_open(&store, &access, storeBytes, key, &provider);
     if (status) {
         printf("OPEN %s\n", ors_status_name(status));
         return 1;
     }
-    printf("OPEN ok %u windows\n", store.window_count);
+    printf("OPEN ok %u windows, split %#" PRIx64 ", mapping window %" PRIu64 " bytes\n", store.window_count, split, window);
     void *scratch = malloc(ors_scratch_bytes());
     struct ors_slot *slot = calloc(slots, sizeof(*slot));
     uint8_t *memory = malloc((size_t)slots * ORS_CHUNK);
@@ -147,6 +201,10 @@ int main(int argc, char **argv)
         totalOk += ok, totalDropped += dropped, totalDamaged += damaged;
         free(state);
     }
+    ors_phys_release(&phys);
+    if (fake.live || fake.refused || phys.map_failures) failed = 1;
+    printf("MAPS %" PRIu64 " unmaps %" PRIu64 " failures %" PRIu64 " refused %" PRIu64 " left %" PRIu64 "\n", phys.maps,
+           phys.unmaps, phys.map_failures, fake.refused, fake.live);
     printf("TOTAL ok %" PRIu64 " dropped %" PRIu64 " damaged %" PRIu64 " reads %" PRIu64 " decodes %" PRIu64 " hits %" PRIu64
            " verified %" PRIu64 " %s\n", totalOk, totalDropped, totalDamaged, reader.stats.reads, reader.stats.decodes,
            reader.stats.hits, reader.stats.verified, failed ? "FAIL" : "PASS");

@@ -159,6 +159,21 @@ def synthetic(tool, S, d):
           f'every block reads back equal to the image (3-slot cache), dropped = {rows["OS"]["dropped"]} '
           f'of {len(dropped)}, random ranges {rows["OS"]["rok"]} ok / {rows["OS"]["rfail"]} refused as expected')
     check(rows['OS']['uuid'] == str(u_os).upper(), 'window UUID comes from the signed envelope')
+    # The kernel's access: two extents around a hole and mapping windows, here at sizes that put chunks across windows and
+    # the extent split inside the chunk data (the mapper refuses any mapping across the hole or past the store).
+    size = (d / 'store.bin').stat().st_size
+    data_split = (size - 3 * 4096 - 5 * 4096) // 4096 * 4096
+    for window, split in ((64 << 20, None), (4096, None), (0x11000, data_split), (0x11000, 0x3000 + 2 * 4096)):
+        extra = ['--window', str(window)] + (['--split', str(split)] if split else [])
+        r = subprocess.run([str(tool), 'check', str(d / 'store.bin'), str(d / 'anchor.bin'), *args, *extra], text=True,
+                           capture_output=True)
+        rows = parse(r.stdout)
+        maps = next((l for l in r.stdout.splitlines() if l.startswith('MAPS')), '')
+        ok = r.returncode == 0 and rows and all(v['verdict'] == 'AGREES' for v in rows.values())
+        if not ok and 'OPEN' in r.stdout and 'OPEN ok' not in r.stdout:
+            # A split inside the header, envelopes or tables cannot be pinned: ors_open must say so (cannot map).
+            ok = 'OPEN cannot map' in r.stdout and split is not None and split < 64 * 1024
+        check(ok, f'window {window} bytes, split {split or "default"}: {maps or r.stdout.strip()[-120:]}')
 
     def mutate(name, fn):
         data = bytearray((d / 'store.bin').read_bytes())

@@ -38,6 +38,7 @@ const char *ors_status_name(int status)
     case ORS_RANGE: return "range";
     case ORS_DROPPED: return "dropped block";
     case ORS_DAMAGED: return "damaged block";
+    case ORS_MAP: return "cannot map";
     default: return "?";
     }
 }
@@ -75,6 +76,147 @@ int ors_descriptor_parse(const uint8_t *p, size_t bytes, const struct vr_crypto 
     return ORS_OK;
 }
 
+int ors_phys_init(struct ors_phys *phys, const struct ors_descriptor *d, uint64_t window_bytes, void *context,
+                  const uint8_t *(*map)(void *, uint64_t, uint64_t, void **), void (*unmap)(void *, void *))
+{
+    if (!phys) return ORS_FORMAT;
+    memset(phys, 0, sizeof(*phys));
+    if (!d || !map || !unmap || !window_bytes || (window_bytes & (ORS_BLOCK - 1)) || d->extent_count < 1 ||
+        d->extent_count > 2)
+        return ORS_FORMAT;
+    /* Only the store's own bytes are ever mapped: the extents are cut to it (the last one UEFI hands over runs to the end
+     * of the region). */
+    uint64_t left = (d->store_bytes + ORS_BLOCK - 1) & ~(uint64_t)(ORS_BLOCK - 1);
+    unsigned count = 0;
+    for (unsigned i = 0; i < d->extent_count && left; ++i) {
+        const uint64_t take = d->extent[i].bytes < left ? d->extent[i].bytes : left;
+        phys->extent[count++] = (struct ors_extent){d->extent[i].base, take};
+        left -= take;
+    }
+    if (left || !count) return ORS_FORMAT;
+    phys->extent_count = count;
+    phys->store_bytes = d->store_bytes;
+    phys->window_bytes = window_bytes;
+    phys->context = context;
+    phys->map = map;
+    phys->unmap = unmap;
+    return ORS_OK;
+}
+
+/* Store offset -> extent index and offset inside it; the bytes of that extent from there on. */
+static int locate(const struct ors_phys *p, uint64_t offset, unsigned *index, uint64_t *inner, uint64_t *rest)
+{
+    if (offset >= p->store_bytes) return 0;
+    for (unsigned i = 0; i < p->extent_count; ++i) {
+        if (offset < p->extent[i].bytes) {
+            *index = i;
+            *inner = offset;
+            *rest = p->extent[i].bytes - offset;
+            return 1;
+        }
+        offset -= p->extent[i].bytes;
+    }
+    return 0;
+}
+
+static const uint8_t *phys_pin(void *context, uint64_t offset, uint64_t length)
+{
+    struct ors_phys *p = context;
+    unsigned i;
+    uint64_t inner, rest;
+    if (!length || p->pins >= ORS_PHYS_PINS || !inside(offset, length, p->store_bytes) ||
+        !locate(p, offset, &i, &inner, &rest) || length > rest)
+        return NULL;
+    const uint64_t at = p->extent[i].base + inner, start = at & ~(uint64_t)(ORS_BLOCK - 1);
+    const uint64_t bytes = (at - start + length + ORS_BLOCK - 1) & ~(uint64_t)(ORS_BLOCK - 1);
+    void *handle = NULL;
+    const uint8_t *va = p->map(p->context, start, bytes, &handle);
+    ++p->maps;
+    if (!va) {
+        ++p->map_failures;
+        return NULL;
+    }
+    p->pin[p->pins++] = handle;
+    return va + (at - start);
+}
+
+static int phys_copy(void *context, uint64_t offset, void *dst, uint64_t length)
+{
+    struct ors_phys *p = context;
+    uint8_t *out = dst;
+    if (!inside(offset, length, p->store_bytes)) return -1;
+    while (length) {
+        unsigned i;
+        uint64_t inner, rest;
+        if (!locate(p, offset, &i, &inner, &rest)) return -1;
+        const uint64_t first = inner / p->window_bytes * p->window_bytes;
+        const uint64_t phys = p->extent[i].base + first;
+        const uint64_t span = p->extent[i].bytes - first < p->window_bytes ? p->extent[i].bytes - first : p->window_bytes;
+        struct ors_phys_window *w = NULL, *victim = &p->window[0];
+        for (unsigned k = 0; k < ORS_PHYS_WINDOWS; ++k) {
+            struct ors_phys_window *c = &p->window[k];
+            if (c->va && c->phys == phys) {
+                w = c;
+                break;
+            }
+            if (victim->va && (!c->va || c->used < victim->used)) victim = c;
+        }
+        if (!w) {
+            if (victim->va) {
+                p->unmap(p->context, victim->handle);
+                ++p->unmaps;
+                memset(victim, 0, sizeof(*victim));
+            }
+            void *handle = NULL;
+            const uint8_t *va = p->map(p->context, phys, span, &handle);
+            ++p->maps;
+            if (!va) {
+                ++p->map_failures;
+                return -1;
+            }
+            victim->phys = phys;
+            victim->length = span;
+            victim->va = va;
+            victim->handle = handle;
+            w = victim;
+        }
+        w->used = ++p->clock;
+        const uint64_t at = inner - first;
+        uint64_t n = span - at;
+        if (n > rest) n = rest;
+        if (n > length) n = length;
+        memcpy(out, w->va + at, (size_t)n);
+        out += n;
+        offset += n;
+        length -= n;
+    }
+    return 0;
+}
+
+void ors_phys_access(struct ors_phys *phys, struct ors_access *out)
+{
+    out->context = phys;
+    out->pin = phys_pin;
+    out->copy = phys_copy;
+}
+
+void ors_phys_release(struct ors_phys *p)
+{
+    if (!p || !p->unmap) return;
+    for (unsigned k = 0; k < ORS_PHYS_WINDOWS; ++k) {
+        if (p->window[k].va) {
+            p->unmap(p->context, p->window[k].handle);
+            ++p->unmaps;
+        }
+        memset(&p->window[k], 0, sizeof(p->window[k]));
+    }
+    for (unsigned k = 0; k < p->pins; ++k) {
+        p->unmap(p->context, p->pin[k]);
+        ++p->unmaps;
+    }
+    p->pins = 0;
+}
+
 void ors_uuid_string(const uint8_t uuid[16], char out[37])
 {
     static const char hex[] = "0123456789ABCDEF";
@@ -95,15 +237,17 @@ int ors_find(const struct ors_store *store, const char *name)
     return -1;
 }
 
-int ors_open(struct ors_store *store, const uint8_t *base, uint64_t bytes, const uint8_t *key,
+int ors_open(struct ors_store *store, const struct ors_access *access, uint64_t bytes, const uint8_t *key,
              const struct vr_crypto *crypto)
 {
     static const uint8_t magic[8] = {'O', 'P', 'R', 'O', 'O', 'T', '0', '1'};
     uint8_t digest[32];
     if (!store) return ORS_FORMAT;
     memset(store, 0, sizeof(*store));
-    if (!base || !key || !crypto || !crypto->sha256 || bytes < ORS_HEADER_BYTES) return ORS_FORMAT;
-    const uint8_t *h = base;
+    if (!access || !access->pin || !access->copy || !key || !crypto || !crypto->sha256 || bytes < ORS_HEADER_BYTES)
+        return ORS_FORMAT;
+    const uint8_t *h = access->pin(access->context, 0, ORS_HEADER_BYTES);
+    if (!h) return ORS_MAP;
     const unsigned count = (unsigned)le(h + 16, 4);
     if (!same(h, magic, 8) || le(h + 8, 4) != 1 || le(h + 12, 4) != ORS_HEADER_BYTES || le(h + 20, 4) != ORS_CHUNK ||
         le(h + 24, 8) != bytes || le(h + 32, 8) != 0 || count < 1 || count > ORS_MAX_WINDOWS ||
@@ -111,7 +255,7 @@ int ors_open(struct ors_store *store, const uint8_t *base, uint64_t bytes, const
         return ORS_FORMAT;
     struct ors_store s;
     memset(&s, 0, sizeof(s));
-    s.base = base;
+    s.access = *access;
     s.bytes = bytes;
     s.window_count = count;
     for (unsigned i = 0; i < count; ++i) {
@@ -145,10 +289,11 @@ int ors_open(struct ors_store *store, const uint8_t *base, uint64_t bytes, const
             return ORS_FORMAT;
         for (unsigned j = 0; j < i; ++j)
             if (!strcmp(s.window[j].name, w->name)) return ORS_FORMAT;
-        w->envelope = base + manifest;
+        w->envelope = access->pin(access->context, manifest, manifestBytes);
         w->envelope_bytes = manifestBytes;
-        w->table = base + table;
-        w->data = base + data;
+        w->table = access->pin(access->context, table, tableBytes);
+        if (!w->envelope || !w->table) return ORS_MAP;
+        w->data_offset = data;
         w->data_bytes = dataBytes;
         switch (vr_open(w->envelope, (size_t)manifestBytes, key, 1, crypto, &w->vr)) {
         case VR_OK: break;
@@ -164,15 +309,24 @@ int ors_open(struct ors_store *store, const uint8_t *base, uint64_t bytes, const
     return ORS_OK;
 }
 
+/* Stored LZFSE chunks are smaller than the chunk; the format check allows up to twice that. */
+#define ORS_PACKED_MAX (2u * ORS_CHUNK)
+
+static size_t lzfse_scratch_aligned(void)
+{
+    return (ors_lzfse_scratch_bytes() + 63) & ~(size_t)63;
+}
+
 size_t ors_scratch_bytes(void)
 {
-    return ors_lzfse_scratch_bytes();
+    return lzfse_scratch_aligned() + ORS_PACKED_MAX;
 }
 
 void ors_reader_init(struct ors_reader *reader, void *scratch, struct ors_slot *slots, uint8_t *memory, unsigned count)
 {
     memset(reader, 0, sizeof(*reader));
     reader->scratch = scratch;
+    reader->packed = (uint8_t *)scratch + lzfse_scratch_aligned();
     reader->slot = slots;
     reader->slots = count;
     for (unsigned i = 0; i < count; ++i) {
@@ -183,7 +337,8 @@ void ors_reader_init(struct ors_reader *reader, void *scratch, struct ors_slot *
 }
 
 /* The chunk in a cache slot, decoded but not yet verified (verification is per block, on first use). */
-static int load(struct ors_reader *r, const struct ors_window *w, unsigned window, uint64_t chunk, struct ors_slot **out)
+static int load(struct ors_reader *r, const struct ors_access *access, const struct ors_window *w, unsigned window,
+                uint64_t chunk, struct ors_slot **out)
 {
     const uint64_t key = (uint64_t)window << 56 | chunk;
     struct ors_slot *victim = &r->slot[0];
@@ -207,9 +362,10 @@ static int load(struct ors_reader *r, const struct ors_window *w, unsigned windo
     if (kind == 0 && stored == 0) {
         memset(victim->data, 0, (size_t)length);
     } else if (kind == 1 && stored == length) {
-        memcpy(victim->data, w->data + offset, (size_t)length);
-    } else if (kind == 2 && stored > 0 && stored <= ORS_CHUNK * 2) {
-        if (ors_lzfse_decode(victim->data, (size_t)length, w->data + offset, (size_t)stored, r->scratch) != length)
+        if (access->copy(access->context, w->data_offset + offset, victim->data, length)) return ORS_MAP;
+    } else if (kind == 2 && stored > 0 && stored <= ORS_PACKED_MAX) {
+        if (access->copy(access->context, w->data_offset + offset, r->packed, stored)) return ORS_MAP;
+        if (ors_lzfse_decode(victim->data, (size_t)length, r->packed, (size_t)stored, r->scratch) != length)
             return ORS_DAMAGED;
     } else {
         return ORS_DAMAGED;
@@ -236,7 +392,7 @@ int ors_read(struct ors_reader *r, const struct ors_store *store, unsigned windo
         const uint64_t chunkBytes = w->image_bytes - start < ORS_CHUNK ? w->image_bytes - start : ORS_CHUNK;
         const uint64_t at = offset - start, n = length < chunkBytes - at ? length : chunkBytes - at;
         struct ors_slot *slot = NULL;
-        int status = load(r, w, window, chunk, &slot);
+        int status = load(r, &store->access, w, window, chunk, &slot);
         if (status) {
             ++r->stats.damaged;
             return status;
