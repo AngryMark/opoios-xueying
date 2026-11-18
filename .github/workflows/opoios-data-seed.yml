@@ -1,0 +1,175 @@
+name: opoios-data-seed
+
+# OPOIOS stage 4 path 1, step 6 (docs/07-stage4-ram-root.md in the OPOIOS project): the Data volume seed and the owner trust
+# bundle of the RAM root boot. The phone has no storage for iOS: Data is a RamBlock RAM disk (PackedRAMDisk in the payload)
+# made from this seed on every boot, so every boot is a first boot.
+# - The OS disk image of the pinned iPhone17,2 24A446 IPSW is fetched and decrypted as in opoios-root-store.yml and mounted
+#   read-only; UniXNU scripts/make-data-seed.py makes the seed from its /private/var as aston does (--skip-setup with
+#   UNIXNU_SEED_FIRST_BOOT_MIGRATION=1: Setup is marked done, and the first boot runs the data migration that makes the
+#   system apps' containers), --gib of logical size (RAM is used only for what is written);
+# - scripts/opoios-seed-tweaks.py keeps SpringBoard from dimming and locking (no touch yet), with the same volume UUID;
+# - UniXNU scripts/bundle-ipsw-trust.py bundles the IPSW's StaticTrustCache, Cryptex1,SystemTrustCache and
+#   Cryptex1,AppTrustCache unchanged (aston's [payload.runtime] trust_components) for the full root of step 7.
+# The kernel binds Data by its volume UUID (CONFIG_XNU_OWNER_DATA_VOLUME_UUID), so a seed is made once and kept: a new run is
+# a new installation with a new UUID.
+#
+# Public repository (OPOIOS docs/05-public-ci.md): the seed and the trust bundle are Apple's software and leave the runner only
+# sealed to the owner's key (scripts/opoios-ci-seal.sh); the job summary shows the volume UUID and sizes only. Manual start
+# only, only in the owner's repository; actions pinned to commit SHAs; checkouts keep no credentials; the GITHUB_TOKEN can only
+# read. No phone involved.
+#
+# Run: gh workflow run opoios-data-seed.yml -R <owner>/<repo> --ref xueying [-f gib=4]
+#      then, on the PC (WSL): bash scripts/ci-artifact.sh fetch <run-id> xueying-data-seed   (OPOIOS project)
+
+on:
+  workflow_dispatch:
+    inputs:
+      gib:
+        description: 'Logical size of the Data volume in GiB (3..64)'
+        required: false
+        default: '4'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: opoios-data-seed
+  cancel-in-progress: true
+
+jobs:
+  seed:
+    if: github.repository_owner == 'AngryMark'
+    runs-on: macos-26
+    timeout-minutes: 120
+    env:
+      SEALED: ${{ github.workspace }}/sealed
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: UniXNU-xueying
+          persist-credentials: false
+      - name: recipient key
+        run: |
+          [ -s UniXNU-xueying/ci/opoios-artifact-recipient.pem ] || { echo "::error::ci/opoios-artifact-recipient.pem is missing"; exit 1; }
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: UniXNU/UniXNU
+          # The pin of opoios-kernel.yml. Its scripts (IPSW reader, make-data-seed.py, seed-data-grow.py, bundle-ipsw-trust.py),
+          # the iOS 27 profile and drivers/DarwinBoot (packed_ramdisk.py) are used here.
+          ref: 00f47f6875749dec49bb782718dff1de28006856
+          path: UniXNU
+          submodules: false
+          persist-credentials: false
+      - name: DarwinBoot submodule
+        working-directory: UniXNU
+        run: git submodule update --init -- drivers/DarwinBoot && ls drivers/DarwinBoot/Test/packed_ramdisk.py
+      - name: iOS 27 profile and seed patches
+        # unixnu-patches/: the ios-27.0.1-24A446 profile and make-data-seed.py's UNIXNU_SEED_FIRST_BOOT_MIGRATION (0002).
+        working-directory: UniXNU
+        run: for p in ../UniXNU-xueying/unixnu-patches/*.patch; do echo "apply $p"; git apply "$p"; done
+      - name: tools
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for attempt in 1 2 3; do
+            brew install openssl@3 blacktop/tap/ipsw && break
+            echo "::warning::brew install failed (attempt $attempt)"; sleep 45
+          done
+          if ! command -v ipsw >/dev/null; then
+            dir="$RUNNER_TEMP/ipsw"; archive=ipsw_3.1.743_macOS_arm64_extras.tar.gz
+            gh release download v3.1.743 -R blacktop/ipsw -p "$archive" -D "$dir"
+            echo "c7da3f9fba1901a608e81d06269f4050f60a5b55ebf7418535336bb9c8810eba  $dir/$archive" | shasum -a 256 -c -
+            tar -xzf "$dir/$archive" -C "$dir"
+            echo "$dir" >> "$GITHUB_PATH"; export PATH="$dir:$PATH"
+          fi
+          echo "OPENSSL=$(brew --prefix openssl@3)/bin/openssl" >> "$GITHUB_ENV"
+          command -v ipsw && [ -x /usr/bin/aea ] && [ -x "$(brew --prefix openssl@3)/bin/openssl" ]
+          grep -q UNIXNU_SEED_FIRST_BOOT_MIGRATION UniXNU/scripts/make-data-seed.py
+          df -h "$GITHUB_WORKSPACE"
+      - name: fetch and decrypt OS, extract the trust caches
+        run: |
+          python3 - <<'PY'
+          import json, sys, tomllib, types
+          from pathlib import Path
+          sys.path.insert(0, 'UniXNU/scripts')
+          from unixnu import ipsw
+          profile = tomllib.loads(Path('UniXNU/profiles/os/ios-27.0.1-24A446/profile.toml').read_text())
+          ctx = types.SimpleNamespace(board={'ipsw': profile['ipsw']}, option_text=lambda *names: None,
+                                      out_root=Path('images').resolve())
+          source = ipsw.Ipsw(ctx)
+          plain = source.disk_image('OS')
+          record = json.loads(plain.with_suffix(plain.suffix + '.json').read_text())
+          if record.get('sha256') != profile['root']['os_image_sha256']:
+              sys.exit(f'OS: decrypted image sha256 {record.get("sha256")} is not the profile\'s')
+          print(f'OS: {plain.name}, {plain.stat().st_size} bytes, sha256 matches the profile', flush=True)
+          archive = plain.with_name(plain.name + '.aea')
+          if archive.exists():
+              archive.unlink()
+          trust = [str(source.extract(name)) for name in ('StaticTrustCache', 'Cryptex1,SystemTrustCache', 'Cryptex1,AppTrustCache')]
+          for path in trust:
+              print(f'trust: {Path(path).name}, {Path(path).stat().st_size} bytes', flush=True)
+          Path('images/os').write_text(str(plain) + '\n')
+          Path('images/trust').write_text('\n'.join(trust) + '\n')
+          PY
+      - name: Data seed
+        env:
+          GIB: ${{ inputs.gib }}
+        run: |
+          case $GIB in ''|*[!0-9]*) echo "::error::gib must be a number"; exit 1 ;; esac
+          [ "$GIB" -ge 3 ] && [ "$GIB" -le 64 ] || { echo "::error::gib must be in 3..64"; exit 1; }
+          mkdir -p seed os-mount
+          attached=$(hdiutil attach -readonly -nobrowse -mountpoint "$PWD/os-mount" -plist "$(cat images/os)")
+          device=$(printf '%s' "$attached" | python3 -c 'import plistlib,sys; print(plistlib.loads(sys.stdin.buffer.read())["system-entities"][0]["dev-entry"])')
+          [ -f os-mount/sbin/launchd ] || { echo "::error::not the OS volume"; hdiutil detach "$device"; exit 1; }
+          set +e
+          # Root keeps the file owners of /private/var. As aston: Setup done, the first boot migrates the data.
+          sudo env "PATH=$PATH" UNIXNU_SEED_FIRST_BOOT_MIGRATION=1 python3 UniXNU/scripts/make-data-seed.py \
+            "$PWD/os-mount" "$PWD/seed/data-base.dbr" --gib "$GIB" --build 24A446 --skip-setup
+          status=$?
+          set -e
+          hdiutil detach "$device"
+          [ "$status" = 0 ] || exit "$status"
+          sudo env "PATH=$PATH" UNIXNU_TREE="$PWD/UniXNU" python3 UniXNU-xueying/scripts/opoios-seed-tweaks.py \
+            "$PWD/seed/data-base.dbr" "$PWD/seed/data.dbr" | tee seed/tweaks.json
+          sudo chown -R "$(id -u):$(id -g)" seed
+          rm -f seed/data-base.dbr
+      - name: owner trust bundle
+        run: python3 UniXNU/scripts/bundle-ipsw-trust.py seed/owner-trust.bundle $(cat images/trust)
+      - name: record
+        env:
+          GIB: ${{ inputs.gib }}
+        run: |
+          id=$(UNIXNU_TREE="$PWD/UniXNU" python3 UniXNU-xueying/scripts/opoios-seed-tweaks.py --uuid seed/data.dbr)
+          python3 - "$id" "$GIB" <<'PY'
+          import hashlib, json, sys
+          from pathlib import Path
+          def sha(p): return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+          info = dict(data_volume_uuid=sys.argv[1], gib=int(sys.argv[2]), build='24A446', recipe='make-data-seed.py --skip-setup, '
+                      'UNIXNU_SEED_FIRST_BOOT_MIGRATION=1, opoios-seed-tweaks.py (no dim, no lock, no idle sleep)',
+                      data_bytes=Path('seed/data.dbr').stat().st_size, data_sha256=sha('seed/data.dbr'),
+                      trust_bytes=Path('seed/owner-trust.bundle').stat().st_size, trust_sha256=sha('seed/owner-trust.bundle'))
+          Path('seed/data.json').write_text(json.dumps(info, indent=2) + '\n')
+          print(json.dumps(info, indent=2))
+          PY
+          {
+            echo "### iPhone17,2 24A446 Data seed"
+            echo
+            echo "Data volume UUID \`$id\`, $(stat -f %z seed/data.dbr) bytes packed, ${GIB} GiB logical; owner trust bundle $(stat -f %z seed/owner-trust.bundle) bytes."
+            echo
+            echo "Fetch on the PC: \`bash scripts/ci-artifact.sh fetch $GITHUB_RUN_ID xueying-data-seed\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: free the images
+        if: always()
+        run: rm -rf images
+      - name: seal
+        run: bash UniXNU-xueying/scripts/opoios-ci-seal.sh xueying-data-seed "$GITHUB_WORKSPACE/seed" "$SEALED/seed" data.dbr data.json owner-trust.bundle tweaks.json
+      - name: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: xueying-data-seed
+          retention-days: 7
+          if-no-files-found: error
+          path: ${{ env.SEALED }}/seed/
+      - name: clean up
+        if: always()
+        run: sudo rm -rf images seed os-mount sealed
