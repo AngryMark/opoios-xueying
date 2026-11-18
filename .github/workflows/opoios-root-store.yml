@@ -1,0 +1,205 @@
+name: opoios-root-store
+
+# OPOIOS stage 4 path 1, step 4 (docs/07-stage4-ram-root.md in the OPOIOS project): the RAM root store. Takes the OS and
+# Cryptex1,SystemOS disk images of the pinned iPhone17,2 24A446 IPSW exactly as opoios-root-measure.yml does (Apple's CDN by
+# HTTP ranges through UniXNU's ipsw code, macOS aea, the [root] image sha256 of the iOS 27 profile), then
+# scripts/opoios-root-store.py builds the store: the original images minus the blocks of the dropped trim groups, in LZFSE
+# chunks of 64 KiB, each image with its signed VerifiedRoot manifest (scripts/policies/ios-27.0.1-24A446); the build checks
+# every image against that manifest and refuses a store above the budget. `verify` then decodes every chunk and checks every
+# kept block against the manifest, as the kernel will.
+#
+# Public repository (OPOIOS docs/05-public-ci.md): the store is Apple's software, so it leaves the runner only sealed to the
+# owner's key (scripts/opoios-ci-seal.sh), in parts of 1 GiB (artifacts xueying-root-store-00 ...), so that the PC can fetch
+# and decrypt one part at a time; xueying-root-store-info holds store.json (sizes, SHA-256), summary.md and report.txt
+# (counts and dropped path names), sealed too. The job summary shows the sizes only. Manual start only, only in the owner's
+# repository; actions pinned to commit SHAs; checkouts keep no credentials; the GITHUB_TOKEN can only read. No phone involved.
+#
+# Run: gh workflow run opoios-root-store.yml -R <owner>/<repo> --ref xueying [-f drop=a,b] [-f budget=BYTES]
+#      then, on the PC (WSL): bash scripts/ci-artifact.sh fetch-store <run-id>   (OPOIOS project)
+
+on:
+  workflow_dispatch:
+    inputs:
+      drop:
+        description: 'Trim groups to drop, comma separated (empty: the store default)'
+        required: false
+        default: ''
+      budget:
+        description: 'Largest store in bytes (the proven capacity in phone RAM)'
+        required: false
+        default: '8272932864'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: opoios-root-store
+  cancel-in-progress: true
+
+jobs:
+  store:
+    if: github.repository_owner == 'AngryMark'
+    runs-on: macos-26
+    timeout-minutes: 240
+    env:
+      SEALED: ${{ github.workspace }}/sealed
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: UniXNU-xueying
+          persist-credentials: false
+      - name: recipient key
+        run: |
+          [ -s UniXNU-xueying/ci/opoios-artifact-recipient.pem ] || { echo "::error::ci/opoios-artifact-recipient.pem is missing"; exit 1; }
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: UniXNU/UniXNU
+          # The pin of opoios-kernel.yml. Only its scripts/unixnu (the IPSW reader) and the iOS 27 profile are used here.
+          ref: 00f47f6875749dec49bb782718dff1de28006856
+          path: UniXNU
+          submodules: false
+          persist-credentials: false
+      - name: iOS 27 profile
+        working-directory: UniXNU
+        run: for p in ../UniXNU-xueying/unixnu-patches/*.patch; do echo "apply $p"; git apply "$p"; done
+      - name: tools
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for attempt in 1 2 3; do
+            brew install openssl@3 blacktop/tap/ipsw && break
+            echo "::warning::brew install failed (attempt $attempt)"; sleep 45
+          done
+          if ! command -v ipsw >/dev/null; then
+            dir="$RUNNER_TEMP/ipsw"; archive=ipsw_3.1.743_macOS_arm64_extras.tar.gz
+            gh release download v3.1.743 -R blacktop/ipsw -p "$archive" -D "$dir"
+            echo "c7da3f9fba1901a608e81d06269f4050f60a5b55ebf7418535336bb9c8810eba  $dir/$archive" | shasum -a 256 -c -
+            tar -xzf "$dir/$archive" -C "$dir"
+            echo "$dir" >> "$GITHUB_PATH"; export PATH="$dir:$PATH"
+          fi
+          echo "OPENSSL=$(brew --prefix openssl@3)/bin/openssl" >> "$GITHUB_ENV"
+          command -v ipsw && [ -x /usr/bin/aea ] && [ -x "$(brew --prefix openssl@3)/bin/openssl" ]
+          sysctl -n hw.ncpu hw.memsize
+          df -h "$GITHUB_WORKSPACE"
+      - name: store tests (libcompression LZFSE, OpenSSL 3)
+        run: python3 UniXNU-xueying/scripts/opoios-root-store-test.py
+      - name: fetch and decrypt OS and SystemOS
+        id: fetch
+        run: |
+          python3 - <<'PY'
+          import json, os, sys, tomllib, types
+          from pathlib import Path
+          sys.path.insert(0, 'UniXNU/scripts')
+          from unixnu import ipsw
+          profile = tomllib.loads(Path('UniXNU/profiles/os/ios-27.0.1-24A446/profile.toml').read_text())
+          ctx = types.SimpleNamespace(board={'ipsw': profile['ipsw']}, option_text=lambda *names: None,
+                                      out_root=Path('images').resolve())
+          source = ipsw.Ipsw(ctx)
+          wanted = {'OS': profile['root']['os_image_sha256'], 'Cryptex1,SystemOS': profile['root']['systemos_image_sha256']}
+          listing = []
+          for component, digest in wanted.items():
+              name, size, _ = source.info(component)
+              print(f'{component}: {name}, {size} bytes in the IPSW', flush=True)
+              plain = source.disk_image(component)
+              record = json.loads(plain.with_suffix(plain.suffix + '.json').read_text())
+              if record.get('sha256') != digest:
+                  sys.exit(f'{component}: decrypted image sha256 {record.get("sha256")} is not the profile\'s {digest}')
+              print(f'{component}: {plain.name}, {plain.stat().st_size} bytes, sha256 matches the profile', flush=True)
+              archive = plain.with_name(plain.name + '.aea')
+              if archive.exists():
+                  archive.unlink()
+              listing.append(f'{"SystemOS" if component != "OS" else "OS"}={plain}')
+          Path('images/list').write_text('\n'.join(listing) + '\n')
+          PY
+          df -h "$GITHUB_WORKSPACE"
+      - name: build store
+        id: build
+        env:
+          DROP: ${{ inputs.drop }}
+          BUDGET: ${{ inputs.budget }}
+        run: |
+          case $BUDGET in ''|*[!0-9]*) echo "::error::budget must be a number of bytes"; exit 1 ;; esac
+          args=()
+          IFS=',' read -ra groups <<< "$DROP"
+          for g in "${groups[@]}"; do
+            g=$(printf '%s' "$g" | tr -d ' ')
+            case $g in '') ;; *[!a-z0-9-]*) echo "::error::bad group name $g"; exit 1 ;; *) args+=(--drop "$g") ;; esac
+          done
+          set +e
+          python3 UniXNU-xueying/scripts/opoios-root-store.py build --policy UniXNU-xueying/scripts/policies/ios-27.0.1-24A446 \
+            --out store --budget "$BUDGET" "${args[@]}" $(cat images/list)
+          status=$?
+          set -e
+          {
+            echo "### iPhone17,2 24A446 RAM root store (OPROOT01, LZFSE 64 KiB)"
+            echo
+            [ -f store/summary.md ] && cat store/summary.md
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit $status
+      - name: verify store
+        run: python3 UniXNU-xueying/scripts/opoios-root-store.py verify --policy UniXNU-xueying/scripts/policies/ios-27.0.1-24A446 store/store.bin
+      - name: free the images
+        if: always()
+        run: rm -rf images; df -h "$GITHUB_WORKSPACE"
+      - name: seal info
+        if: ${{ !cancelled() }}
+        env:
+          SEAL_ALLOW_MISSING: "1"
+        run: bash UniXNU-xueying/scripts/opoios-ci-seal.sh xueying-root-store-info "$GITHUB_WORKSPACE/store" "$SEALED/info" store.json summary.md report.txt
+      - name: seal store parts
+        id: parts
+        run: |
+          split -b 1073741824 -d -a 2 store/store.bin store/part-
+          rm store/store.bin
+          n=0
+          for p in store/part-*; do
+            i=${p##*-}
+            SEAL_GZIP_LEVEL=1 bash UniXNU-xueying/scripts/opoios-ci-seal.sh "xueying-root-store-$i" "$GITHUB_WORKSPACE/store" "$SEALED/part-$i" "part-$i"
+            rm "$p"
+            n=$((n + 1))
+          done
+          [ "$n" -le 8 ] || { echo "::error::$n parts: the workflow uploads 8"; exit 1; }
+          echo "Store: $n sealed parts. Fetch on the PC: \`bash scripts/ci-artifact.sh fetch-store $GITHUB_RUN_ID\`" >> "$GITHUB_STEP_SUMMARY"
+      - name: upload info
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: xueying-root-store-info
+          retention-days: 3
+          if-no-files-found: ignore
+          path: ${{ env.SEALED }}/info/
+      - name: upload part 00
+        if: ${{ hashFiles('sealed/part-00/*') != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with: { name: xueying-root-store-00, retention-days: 3, compression-level: 0, path: "${{ env.SEALED }}/part-00/" }
+      - name: upload part 01
+        if: ${{ hashFiles('sealed/part-01/*') != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with: { name: xueying-root-store-01, retention-days: 3, compression-level: 0, path: "${{ env.SEALED }}/part-01/" }
+      - name: upload part 02
+        if: ${{ hashFiles('sealed/part-02/*') != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with: { name: xueying-root-store-02, retention-days: 3, compression-level: 0, path: "${{ env.SEALED }}/part-02/" }
+      - name: upload part 03
+        if: ${{ hashFiles('sealed/part-03/*') != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with: { name: xueying-root-store-03, retention-days: 3, compression-level: 0, path: "${{ env.SEALED }}/part-03/" }
+      - name: upload part 04
+        if: ${{ hashFiles('sealed/part-04/*') != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with: { name: xueying-root-store-04, retention-days: 3, compression-level: 0, path: "${{ env.SEALED }}/part-04/" }
+      - name: upload part 05
+        if: ${{ hashFiles('sealed/part-05/*') != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with: { name: xueying-root-store-05, retention-days: 3, compression-level: 0, path: "${{ env.SEALED }}/part-05/" }
+      - name: upload part 06
+        if: ${{ hashFiles('sealed/part-06/*') != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with: { name: xueying-root-store-06, retention-days: 3, compression-level: 0, path: "${{ env.SEALED }}/part-06/" }
+      - name: upload part 07
+        if: ${{ hashFiles('sealed/part-07/*') != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with: { name: xueying-root-store-07, retention-days: 3, compression-level: 0, path: "${{ env.SEALED }}/part-07/" }
+      - name: clean up
+        if: always()
+        run: rm -rf images store sealed

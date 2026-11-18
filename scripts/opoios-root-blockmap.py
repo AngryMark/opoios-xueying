@@ -61,6 +61,13 @@ GROUPS = [
         'MediaAnalysis', 'VisualLookUp', 'CoreSceneUnderstanding', 'EmbeddingCore', 'VisionCore', 'VisualIntelligenceCore',
         'GESS', 'AppleCV3D')], None,
      'resources of photo and vision analysis frameworks (their code is in the dyld shared cache)'),
+    # Extra groups that the RAM root store (scripts/opoios-root-store.py) drops by default, on top of the default ones.
+    ('watch-faces', False, ['/System/Library/NanoTimeKit/FaceBundles/*'], None, 'Apple Watch faces (no watch pairs here)'),
+    ('tts-maui', False, ['/System/Library/PrivateFrameworks/TextToSpeechMauiSupport.framework/TTSResources/*'], None,
+     'more text-to-speech voices'),
+    ('camera-models', False, ['/System/Library/CoreServices/RawCamera.bundle/RawSFD/*',
+                              '/System/Library/PrivateFrameworks/AppleDepth.framework/MLModels/*'], None,
+     'RAW demosaic weights and depth models of the Apple camera pipeline'),
 ]
 VARIANTS = ('full', 'default', 'aggressive')
 

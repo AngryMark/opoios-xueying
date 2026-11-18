@@ -4,6 +4,7 @@
 #   bash scripts/opoios-ci-seal.sh <name> <base-dir> <out-dir> <path-or-glob relative to base-dir>...
 #
 # A pattern that starts with ? is optional (e.g. the prelink maps, which a successful build may not keep).
+# SEAL_GZIP_LEVEL (default 9) sets the gzip level; 1 for members that are already compressed (the RAM root store).
 #
 # The repository is public, so every artifact can be downloaded by anyone signed in to GitHub. The kernel (kernel.macho, the
 # prelinked iPhone17,2 kernelcache's kexts), the reference kernels, the prelink maps and the build logs therefore go out only
@@ -52,7 +53,7 @@ fi
 # Two passes (bsdtar on the runner, GNU tar on the PC): the members, then SHA256SUMS at the top of the bundle.
 tar -cf "$stage/bundle.tar" -C "$base" -T "$list"
 tar -rf "$stage/bundle.tar" -C "$stage" SHA256SUMS
-gzip -9 -n "$stage/bundle.tar"
+gzip -"${SEAL_GZIP_LEVEL:-9}" -n "$stage/bundle.tar"
 
 mkdir -p "$out"
 "$openssl" rand -hex 32 > "$stage/key"
