@@ -36,6 +36,9 @@ archives = [
   "build-libpthread-kernel.py",
   "component:ShengUfs",
   "build-sheng-source-storage.py --policy-dir scripts/policies/ios-27.0.1-24A446",
+  # OPOIOS stage 4: the RAM root store driver (OpoiosRootStoreDisk, OpoiosRootStore.c, the LZFSE decoder) into
+  # build/opoios-root-store/libOpoiosRootStore.a; it needs the IOStorageFamily headers the step above prepares.
+  "build-opoios-root-store.py",
   "component:RamBlock",
   "component:Adreno740",
   "fetch-sheng-dts.py",
@@ -121,7 +124,10 @@ kernel_args = [
   # (device 2026-11-15: "Failed to mount root device" after waiting for the volume UUID).
   # opoios-sys-report=60: 60 s after the RAM root starts the kernel panics with one row: root, RAM disk traffic, processes by pid
   # (package/SourceStorage.cpp), and prints that row every 15 s before. The panic ends the run; the phone then powers off.
-  "rd=md0-ramblock", "opoios-ram-root=1", "opoios-sys-report=60",
+  # opoios-ram-root=2 (stage 4) does the same and then starts the RAM root store UEFI received over USB, if there is one:
+  # its OS and SystemOS windows as verified read-only disks (package/OpoiosRootStoreDisk.cpp). Without a store the STORE
+  # row of the report says why (st -2: no descriptor) and the boot goes on as with 1.
+  "rd=md0-ramblock", "opoios-ram-root=2", "opoios-sys-report=60",
   "offline-mobile-graphics-load=1", "offline-mobile-graphics-client=1", "offline-legacy-register=1", "offline-legacy-gop=1",
   "offline-legacy-unit-scale=3", "offline-legacy-pm=1", "offline-legacy-validate=1", "offline-legacy-transfer=1",
   "offline-legacy-cpu-present=1", "offline-legacy-phase=4", "offline-key-events=1", "sheng-buttons=1",

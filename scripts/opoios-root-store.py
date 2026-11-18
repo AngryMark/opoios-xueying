@@ -112,7 +112,8 @@ class Lzfse:
             self._dec = lambda dst, n, src, m: lib.compression_decode_buffer(dst, n, src, m, dec, code)
             self.name = 'LZFSE (libcompression)'
         else:
-            path = ctypes.util.find_library('lzfse')
+            # OPOIOS_LZFSE_LIB: a liblzfse built from package/lzfse (scripts/check-opoios-root-store.py does).
+            path = os.environ.get('OPOIOS_LZFSE_LIB') or ctypes.util.find_library('lzfse')
             if not path:
                 raise RuntimeError('no LZFSE encoder: macOS libcompression or the reference liblzfse (apt liblzfse-dev)')
             lib = ctypes.CDLL(path)
@@ -501,7 +502,7 @@ def _verify_span(args):
 
 def verify(path, anchors, jobs=0, codec=None, log=print):
     """Decode every chunk and check every present block; returns per-window counts."""
-    with Store(path, anchors, codec) as store:
+    with Store(path, anchors, codec or (None if jobs and jobs > 1 else Lzfse())) as store:
         return _verify(store, path, jobs, log)
 
 

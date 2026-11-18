@@ -2,7 +2,9 @@ CONFIG_XNU_BUILD_ARCHIVES=y
 CONFIG_XNU_CRYPTO_BOOTSTRAP="source"
 CONFIG_XNU_DT_PANIC_REGION=y
 CONFIG_XNU_ARMVIRT_PLATFORM=n
-CONFIG_XNU_EXTRA_LD_ARCHIVES="-Wl,-force_load,{tree}/build/sheng-source-storage/libShengSourceStorage.a"
+# OPOIOS stage 4: the RAM root store driver (scripts/build-opoios-root-store.py); SourceStorage.cpp and
+# SourceRootBinding.cpp call into it, so it is linked whenever the source storage archive is.
+CONFIG_XNU_EXTRA_LD_ARCHIVES="-Wl,-force_load,{tree}/build/sheng-source-storage/libShengSourceStorage.a -Wl,-force_load,{tree}/build/opoios-root-store/libOpoiosRootStore.a"
 CONFIG_XNU_KERNEL_CHAINED_FIXUPS=y
 # The boot image carries the signed policy headers; their hash tables are userdata objects.
 CONFIG_XNU_SOURCE_STORAGE_TABLES="userdata"

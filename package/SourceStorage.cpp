@@ -16,6 +16,10 @@ extern kmod_info_t g_kernel_kmod_info;
 extern "C" void source_storage_base_init(void) __asm__("__GLOBAL__sub_I_IOBlockStorageDevice.cpp");
 extern "C" void source_storage_ufs_init(void) __asm__("__GLOBAL__sub_I_NativeUfs.cpp");
 extern "C" void source_storage_ram_init(void) __asm__("__GLOBAL__sub_I_NativeRamBlock.cpp");
+// OPOIOS stage 4: the RAM root store's window disks (OpoiosRootStoreDisk.cpp, libOpoiosRootStore.a).
+extern "C" void source_storage_store_init(void) __asm__("__GLOBAL__sub_I_OpoiosRootStoreDisk.cpp");
+extern "C" bool opoios_root_store_start(IOService *provider);
+extern "C" void opoios_root_store_row(char *out, size_t size);
 extern "C" IOService *native_ufs_source_create(void);
 extern "C" bool native_source_root_policies_load(void);
 // NativeUfs records how far root start got and the last soft-failure reason.
@@ -372,7 +376,7 @@ extern "C" unsigned opoios_screen_text(char *out, unsigned size)
 static void opoios_sys_report(void *argument, wait_result_t)
 {
     const unsigned limit = (unsigned)(uintptr_t)argument;
-    static char sys[640], pid1[160], image4[360], cached[200], trace[200], image4Thread[420], busy[480];
+    static char sys[640], pid1[160], image4[360], cached[200], trace[200], image4Thread[420], busy[480], store[200];
     uint64_t at = 0;
     unsigned iteration = 0;
     for (unsigned elapsed = 0; elapsed < limit;) {
@@ -404,11 +408,14 @@ static void opoios_sys_report(void *argument, wait_result_t)
         printf("%s\n", sys);
         opoios_report_mark = iteration * 10 + 6;
         printf("OPOIOS %s\n", busy);
+        opoios_root_store_row(store, sizeof store);
+        opoios_report_mark = iteration * 10 + 7;
+        printf("OPOIOS %s\n", store);
         opoios_report_mark = iteration * 10 + 9;
     }
     opoios_report_mark = 1000;
-    panic("%s\nOPOIOS I4T %s\nOPOIOS LD %s | %s\nOPOIOS SAMPLE at %llus step %u | %s\n%s\nOPOIOS %s", image4, image4Thread, cached,
-          trace, (unsigned long long)at, (unsigned)opoios_sampler_step, pid1, sys, busy);
+    panic("%s\nOPOIOS I4T %s\nOPOIOS LD %s | %s\nOPOIOS SAMPLE at %llus step %u | %s\n%s\nOPOIOS %s\nOPOIOS %s", image4, image4Thread,
+          cached, trace, (unsigned long long)at, (unsigned)opoios_sampler_step, pid1, sys, busy, store);
 }
 
 static void opoios_sys_report_start(void)
@@ -431,10 +438,13 @@ static void opoios_sys_report_start(void)
 // disk is started on the platform root. NativeUfs is never registered, created or started, so nothing reaches the
 // UFS controller; the root policies (they describe a UFS root) are not loaded and no log writer runs. NativeRamBlock
 // opens the UFS store only with sheng-data-persist (storeMode), which this board never passes.
+// opoios-ram-root=2 (stage 4) also registers OpoiosRootStoreDisk and, after the RAM disk, starts the RAM root store that
+// UEFI received over USB: its OS and SystemOS windows as verified read-only disks (OpoiosRootStoreDisk.cpp). A missing or
+// bad store is reported in the STORE row, not a panic, so the rest of the boot still shows how far it got.
 static void opoios_ram_root_start(void)
 {
     unsigned enabled = 0;
-    if (!PE_parse_boot_argn("opoios-ram-root", &enabled, sizeof(enabled)) || enabled != 1 || attempted)
+    if (!PE_parse_boot_argn("opoios-ram-root", &enabled, sizeof(enabled)) || (enabled != 1 && enabled != 2) || attempted)
         return;
     attempted = true;
     OSReturn status = OSKextLoadKextWithIdentifier("com.apple.iokit.IOStorageFamily");
@@ -453,6 +463,7 @@ static void opoios_ram_root_start(void)
     if (!handle) panic("SourceStorage: OPOIOS RAM root: cannot begin class registration");
     source_storage_base_init();
     source_storage_ram_init();
+    if (enabled == 2) source_storage_store_init();
     status = OSMetaClass::postModLoad(handle);
     if (status != kOSReturnSuccess)
         panic("SourceStorage: OPOIOS RAM root: class registration failed %x", status);
@@ -466,6 +477,12 @@ static void opoios_ram_root_start(void)
     if (!seed) panic("SourceStorage: OPOIOS RAM root: the loader handed over no RAM disk");
     start_data_disk(provider);
     printf("SourceStorage: OPOIOS RAM root started, no UFS\n");
+    if (enabled == 2) {
+        const bool store = opoios_root_store_start(provider);
+        char row[200];
+        opoios_root_store_row(row, sizeof row);
+        printf("SourceStorage: OPOIOS RAM root store %s: %s\n", store ? "started" : "not started", row);
+    }
     opoios_sys_report_start();
 }
 

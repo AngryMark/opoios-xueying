@@ -15,6 +15,8 @@
 
 extern "C" {
 int native_ufs_block_authenticates(IOService *provider, const char *uuid, uint8_t *digest);
+// OPOIOS stage 4: a RAM root store window disk (OpoiosRootStoreDisk.cpp); -1 when `provider` is not one.
+int opoios_root_store_authenticates(IOService *provider, const char *uuid, uint8_t *digest);
 int native_verified_block_root_authorized(dev_t device);
 int native_verified_block_manifest_sha384(dev_t device, const char *uuid, uint8_t digest[48]);
 int native_verified_block_volume_device(const char *uuid, dev_t *device, char *path, size_t size);
@@ -50,6 +52,11 @@ static int verifiedVolumeQuery(dev_t device, const char *expectedUUID, uint8_t *
             (expectedUUID && strcmp(expectedUUID, uuid->getCStringNoCopy()))) continue;
         unsigned depth = 0;
         for (IOService *provider = media; provider && depth < 64; provider = provider->getProvider(), ++depth) {
+            const int store = opoios_root_store_authenticates(provider, uuid->getCStringNoCopy(), manifestDigest);
+            if (store >= 0) {
+                authenticated = store == 1;
+                break;
+            }
             const int ufs = native_ufs_block_authenticates(provider, uuid->getCStringNoCopy(), manifestDigest);
             if (ufs >= 0) {
                 authenticated = ufs == 1;
