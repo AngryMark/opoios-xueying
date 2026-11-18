@@ -4,7 +4,9 @@ name: opoios-root-measure
 # RAM disk would have to hold. Takes the OS and Cryptex1,SystemOS disk images of the pinned IPSW (Apple's CDN, by HTTP ranges,
 # through UniXNU's own ipsw code), decrypts them (macOS aea, key fetched by ipsw), checks them against the [root] image sha256
 # of the iOS 27 profile, and measures them with scripts/opoios-measure-root.py: nonzero 4 KiB and 16 KiB pages, APFS used
-# capacity, space per directory and the largest files.
+# capacity, space per directory and the largest files. Then scripts/opoios-root-blockmap.py (stage 4 path 1,
+# docs/07-stage4-ram-root.md): which files use each block, what the trim groups drop, and the stored size of the images as LZ4
+# and LZFSE chunks of 16, 64 and 128 KiB, full and trimmed.
 #
 # Public repository (OPOIOS docs/05-public-ci.md): the images never leave the runner and are not cached. The report holds sizes
 # and path names only; it is still sealed to the owner's key like every other output (scripts/opoios-ci-seal.sh), and the job
@@ -28,7 +30,7 @@ jobs:
   measure:
     if: github.repository_owner == 'AngryMark'
     runs-on: macos-26
-    timeout-minutes: 120
+    timeout-minutes: 180
     env:
       SEALED: ${{ github.workspace }}/sealed
     steps:
@@ -70,6 +72,7 @@ jobs:
           command -v ipsw && [ -x /usr/bin/aea ] && [ -x "$(brew --prefix openssl@3)/bin/openssl" ]
           df -h "$GITHUB_WORKSPACE"
       - name: fetch and decrypt OS and SystemOS
+        id: fetch
         run: |
           python3 - <<'PY'
           import json, os, sys, tomllib, types
@@ -107,11 +110,23 @@ jobs:
             echo
             echo "Full report (sizes and paths), sealed: \`bash scripts/ci-artifact.sh fetch $GITHUB_RUN_ID xueying-root-measure\`"
           } >> "$GITHUB_STEP_SUMMARY"
+      - name: block map and chunk compression
+        if: ${{ !cancelled() && steps.fetch.outcome == 'success' }}
+        run: |
+          sysctl -n hw.ncpu hw.memsize
+          python3 UniXNU-xueying/scripts/opoios-root-blockmap.py --out blockmap $(cat images/list)
+          {
+            echo "### Trimmed, compressed RAM root: stored size (GiB)"
+            echo
+            cat blockmap/summary.md
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: seal report
         if: always()
         env:
           SEAL_ALLOW_MISSING: "1"
-        run: bash UniXNU-xueying/scripts/opoios-ci-seal.sh xueying-root-measure "$GITHUB_WORKSPACE/report" "$SEALED/report" 'report.txt' 'summary.md'
+        run: |
+          bash UniXNU-xueying/scripts/opoios-ci-seal.sh xueying-root-measure "$GITHUB_WORKSPACE" "$SEALED/report" \
+            'report/report.txt' 'report/summary.md' 'blockmap/report.txt' 'blockmap/summary.md'
       - name: report
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -122,4 +137,4 @@ jobs:
           path: ${{ env.SEALED }}/report/
       - name: clean up
         if: always()
-        run: rm -rf images report
+        run: rm -rf images report blockmap
