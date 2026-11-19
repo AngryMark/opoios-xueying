@@ -51,9 +51,11 @@ jobs:
           submodules: false
           persist-credentials: false
       - name: GPU submodules
-        # build-adreno-metal-plugin.py and build-turnip-darwin.py read drivers/AdrenoMetal, drivers/Adreno740 and kits/AdrenoPM4.
+        # build-adreno-metal-plugin.py and build-turnip-darwin.py read drivers/AdrenoMetal, drivers/Adreno740 and kits/AdrenoPM4;
+        # AdrenoMetal's GpuScanoutPresenter.h includes ../GopFramebuffer/NativeGOPWire.h and NativeHalfCodes.h (its only include
+        # outside its own tree; run 44554268753 stopped there after Turnip and the Metal bridge had built).
         working-directory: UniXNU
-        run: git submodule update --init -- drivers/AdrenoMetal drivers/Adreno740 kits/AdrenoPM4 kits/AdrenoFirmware
+        run: git submodule update --init -- drivers/AdrenoMetal drivers/Adreno740 drivers/GopFramebuffer kits/AdrenoPM4 kits/AdrenoFirmware
       - name: patches
         # As opoios-kernel.yml: unixnu-patches/*.patch on the pinned checkout, and the AdrenoMetal component patch (the plugin's
         # QuartzCore addresses keyed by shared cache: the iPhone17,2 cache 1892D244 gets its own). The other component patches
