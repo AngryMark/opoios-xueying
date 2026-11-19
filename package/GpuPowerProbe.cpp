@@ -57,6 +57,7 @@
 #include <string.h>
 extern "C" {
 #include "GpuPowerBoard.h"
+#include "GpuZapAddon.h"
 }
 
 #include "NativeAdrenoGmuContext.h"
@@ -139,6 +140,9 @@ extern "C" const uint8_t native_adreno_sqe_firmware_image[] __attribute__((weak)
 extern "C" const uint64_t native_adreno_sqe_firmware_image_size __attribute__((weak));
 extern "C" const uint8_t native_adreno_zap_image[] __attribute__((weak));
 extern "C" const uint64_t native_adreno_zap_image_size __attribute__((weak));
+// OPOIOS: the GPU addon the loader handed over (drivers/RamBlock) and libkern's zlib, for the ZAP image the kernel does not embed.
+extern "C" int native_ram_block_gpu_addon(const uint8_t **, uint64_t *) __attribute__((weak_import));
+extern "C" int uncompress(unsigned char *, unsigned long *, const unsigned char *, unsigned long);
 extern "C" const uint8_t native_adreno_firmware_image[] __attribute__((weak));
 extern "C" const uint64_t native_adreno_firmware_image_size __attribute__((weak));
 extern "C" ShengGmuDbStatus ShengGmuCommandDbInputs(const uint8_t *, size_t, uint32_t, ShengGmuVoteInputs *) __attribute__((weak));
@@ -581,6 +585,45 @@ int32_t native_gpu_zap[8];
 // per SMC (init, mem_setup, auth): milliseconds and INTERRUPTED resumes; free pages before the zap and 2 s after its last step
 uint32_t native_gpu_zap_cost[6], native_gpu_zap_free[2];
 extern unsigned int vm_page_free_count __attribute__((weak));
+// OPOIOS: where the ZAP image came from: 1 embedded in the kernel, 2 the GPU addon (checked against GPB_ZAP_SHA256); 0 not
+// looked for yet; negative why the addon gave none: -1 no addon, GZA_E_* (-31..-34) the addon or the entry, -41 size, -42 no memory,
+// -43 inflate, -44 SHA-256.
+int32_t native_gpu_zap_source;
+}
+// OPOIOS (xueying): the ZAP image from the GPU addon, for a kernel built without one (the public CI never sees this phone's image).
+// Inflated once into kernel memory that lives for the boot (12 KiB), and used only if its size and SHA-256 are the pinned ones.
+const uint8_t *zapFromAddon(uint64_t *size) {
+    static uint8_t *image;
+    if (image) {*size = GPB_ZAP_BYTES; return image;}
+    const uint8_t *addon = nullptr, *packed = nullptr;
+    uint64_t addonBytes = 0, packedBytes = 0, want = 0;
+    if (!native_ram_block_gpu_addon || !native_ram_block_gpu_addon(&addon, &addonBytes)) {native_gpu_zap_source = -1; return nullptr;}
+    const int found = gza_find(addon, addonBytes, GPB_ZAP_ADDON_NAME, &packed, &packedBytes, &want);
+    if (found) {native_gpu_zap_source = found; return nullptr;}
+    if (want != GPB_ZAP_BYTES) {native_gpu_zap_source = -41; return nullptr;}
+    uint8_t *buffer = static_cast<uint8_t *>(IOMallocData(GPB_ZAP_BYTES));
+    if (!buffer) {native_gpu_zap_source = -42; return nullptr;}
+    unsigned long out = GPB_ZAP_BYTES;
+    if (uncompress(buffer, &out, packed, (unsigned long)packedBytes) != 0 || out != GPB_ZAP_BYTES) {
+        IOFreeData(buffer, GPB_ZAP_BYTES);
+        native_gpu_zap_source = -43;
+        return nullptr;
+    }
+    static const uint8_t pin[32] = GPB_ZAP_SHA256;
+    uint8_t digest[32];
+    SHA256_CTX context;
+    SHA256_Init(&context);
+    SHA256_Update(&context, buffer, GPB_ZAP_BYTES);
+    SHA256_Final(digest, &context);
+    if (memcmp(digest, pin, sizeof pin)) {
+        IOFreeData(buffer, GPB_ZAP_BYTES);
+        native_gpu_zap_source = -44;
+        return nullptr;
+    }
+    image = buffer;
+    native_gpu_zap_source = 2;
+    *size = GPB_ZAP_BYTES;
+    return image;
 }
 uint32_t rd32le(const uint8_t *p) {return uint32_t(p[0]) | uint32_t(p[1]) << 8 | uint32_t(p[2]) << 16 | uint32_t(p[3]) << 24;}
 uint16_t rd16le(const uint8_t *p) {return uint16_t(p[0] | p[1] << 8);}
@@ -592,13 +635,13 @@ unsigned zapLimit() {
     return zap;
 }
 void zapRow() {
-    // Z<stage>/<limit> i<init a0>.<ms>.<resumes> m<mem_setup ...> a<auth ...> s<secure fence> f<free pages delta>
+    // Z<stage>/<limit> i<init a0>.<ms>.<resumes> m<mem_setup ...> a<auth ...> s<secure fence> f<free pages delta> o<image source>
     char row[64];
     const int32_t *z = native_gpu_zap;
     const uint32_t *c = native_gpu_zap_cost;
-    snprintf(row, sizeof row, "Z%d/%u i%d.%u.%u m%d.%u.%u a%d.%u.%u s%d f%d", z[0], zapLimit(), z[1], c[0] & 0xffff,
+    snprintf(row, sizeof row, "Z%d/%u i%d.%u.%u m%d.%u.%u a%d.%u.%u s%d f%d o%d", z[0], zapLimit(), z[1], c[0] & 0xffff,
              c[0] >> 16, z[3], c[1] & 0xffff, c[1] >> 16, z[5], c[2] & 0xffff, c[2] >> 16, z[7],
-             int32_t(native_gpu_zap_free[1] - native_gpu_zap_free[0]));
+             int32_t(native_gpu_zap_free[1] - native_gpu_zap_free[0]), native_gpu_zap_source);
     setRow(2, row);
 }
 void zapEnd() {
@@ -611,7 +654,11 @@ void zapAndSecure() {
     native_gpu_zap_free[0] = native_gpu_zap_free[1] = &vm_page_free_count ? vm_page_free_count : 0;
     z[0] = 1; zapRow();
     const uint8_t *fw = &native_adreno_zap_image_size ? native_adreno_zap_image : nullptr;
-    const uint64_t size = fw ? native_adreno_zap_image_size : 0;
+    uint64_t size = fw ? native_adreno_zap_image_size : 0;
+    if (size) native_gpu_zap_source = 1;
+    else fw = zapFromAddon(&size);   // OPOIOS: the kernel embeds none; the GPU addon carries this phone's image
+    if (!fw) size = 0;
+    zapRow();
     // mdt_header_valid: ELF32 magic, 32-byte program headers inside the file; qcom_mdt_read_metadata: >= 2 headers, the
     // first not PT_LOAD, a hash segment (p_flags type 2 in bits 24..26).
     if (size < 52 || fw[0] != 0x7f || fw[1] != 'E' || fw[2] != 'L' || fw[3] != 'F' || fw[4] != 1) {z[0] = -1; zapRow(); return;}

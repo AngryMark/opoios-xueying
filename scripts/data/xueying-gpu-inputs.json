@@ -1,0 +1,12 @@
+{
+  "comment": "OnePlus Open (xueying, CPH2551) Adreno 740 ZAP image pin. The image is signed by the phone maker and authenticated by TrustZone (PAS 13), so only this phone's image runs. It never enters the repository or the CI: OPOIOS keeps it on the owner's PC (~/opoios/secrets/gpu) and scripts/opoios-gpu-addon.py packs it into the GPU addon the payload carries; package/GpuPowerProbe.cpp takes it from /chosen/memory-map/GpuAddon when the kernel's embedded ZAP is empty and checks these values (package/GpuPowerBoard.h GPB_ZAP_BYTES, GPB_ZAP_SHA256).",
+  "firmware": {
+    "files": {
+      "firmware/a740_zap.mbn": {
+        "bytes": 12088,
+        "sha256": "77df3065af279ca5750212deb8e85366752dd72974d8c3417f8e1ad417a6d7cc",
+        "source": "CPH2551 OxygenOS 16 /vendor/firmware/a740_zap.mbn, read on the phone with root (cat, read only) on 2026-11-19; /vendor/firmware also holds the same image split as a740_zap.mdt + .b00-.b02"
+      }
+    }
+  }
+}

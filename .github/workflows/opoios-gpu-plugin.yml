@@ -1,0 +1,138 @@
+name: opoios-gpu-plugin
+
+# OPOIOS stage 6 (docs/09-gpu.md in the OPOIOS project): the Adreno Metal plugin of the GPU path (Mesa Turnip + metal2vulkan,
+# UniXNU scripts/build-adreno-metal-plugin.py --target ios27) packed as a GPU addon (scripts/make-gpu-addon.py --publish
+# --no-daemon), with the CDHashes of the addon's executables for the owner trust module. This is what aston's payload runtime
+# makes (UniXNU scripts/build-boot-runtime.py: build_plugin, make-gpu-addon.py, addon_hashes; its functions are called here,
+# not copied), without the payload, which the owner's PC builds:
+# - the PC adds this phone's Adreno ZAP image to the addon (scripts/opoios-gpu-addon.py). The ZAP never comes here;
+# - the PC appends one trust module with these CDHashes to the Data seed's owner trust bundle (UniXNU trust-append-module.py),
+#   so AMFI trusts the plugin; the IPSW's modules stay byte for byte.
+#
+# Public repository (OPOIOS docs/05-public-ci.md): the addon is built with Apple's SDK and links Apple's frameworks, so it leaves
+# the runner only sealed to the owner's key (scripts/opoios-ci-seal.sh); the job summary shows sizes and hashes only. Manual
+# start only, only in the owner's repository; actions pinned to commit SHAs; checkouts keep no credentials; the GITHUB_TOKEN
+# can only read. No phone involved, no IPSW needed.
+#
+# Run: gh workflow run opoios-gpu-plugin.yml -R <owner>/<repo> --ref xueying
+#      then, on the PC (WSL): bash scripts/ci-artifact.sh fetch <run-id> xueying-gpu-plugin   (OPOIOS project)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: opoios-gpu-plugin
+  cancel-in-progress: true
+
+jobs:
+  plugin:
+    if: github.repository_owner == 'AngryMark'
+    runs-on: macos-26
+    timeout-minutes: 150
+    env:
+      SEALED: ${{ github.workspace }}/sealed
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: UniXNU-xueying
+          persist-credentials: false
+      - name: recipient key
+        run: |
+          [ -s UniXNU-xueying/ci/opoios-artifact-recipient.pem ] || { echo "::error::ci/opoios-artifact-recipient.pem is missing"; exit 1; }
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: UniXNU/UniXNU
+          # The pin of opoios-kernel.yml (aston's): the plugin must speak the kernel's GPU user-client ABI (drivers/Adreno740).
+          ref: 00f47f6875749dec49bb782718dff1de28006856
+          path: UniXNU
+          submodules: false
+          persist-credentials: false
+      - name: GPU submodules
+        # build-adreno-metal-plugin.py and build-turnip-darwin.py read drivers/AdrenoMetal, drivers/Adreno740 and kits/AdrenoPM4.
+        working-directory: UniXNU
+        run: git submodule update --init -- drivers/AdrenoMetal drivers/Adreno740 kits/AdrenoPM4 kits/AdrenoFirmware
+      - name: patches
+        # As opoios-kernel.yml: unixnu-patches/*.patch on the pinned checkout, and the AdrenoMetal component patch (the plugin's
+        # QuartzCore addresses keyed by shared cache: the iPhone17,2 cache 1892D244 gets its own). The other component patches
+        # (ArmCpu, RamBlock) are kernel-only; their checkouts are not here.
+        working-directory: UniXNU
+        run: |
+          for p in ../UniXNU-xueying/unixnu-patches/*.patch; do echo "apply $p"; git apply "$p"; done
+          for p in ../UniXNU-xueying/unixnu-patches/AdrenoMetal/*.patch; do echo "apply $p in drivers/AdrenoMetal"; git -C drivers/AdrenoMetal apply "$(pwd)/$p"; done
+      - name: upstream Mesa patch
+        # UniXNU's turnip-frame-diagnostics.patch lacks one "new file mode" line git apply needs (aston's fix, same file).
+        run: python3 UniXNU-xueying/scripts/fix-upstream-mesa-patch.py UniXNU
+      - name: tools
+        run: |
+          # aston's package.yml list without the kernel and payload tools (dtc, mtools, ipsw).
+          for attempt in 1 2 3; do
+            brew install llvm lld cmake ninja glslang shaderc spirv-tools bison pkgconf rustup && break
+            echo "::warning::brew install failed (attempt $attempt)"; sleep 45
+          done
+          {
+            echo "$HOME/.cargo/bin"
+            echo "/opt/homebrew/opt/llvm/bin"
+            echo "/opt/homebrew/opt/lld/bin"
+            echo "/opt/homebrew/opt/bison/bin"
+          } >> "$GITHUB_PATH"
+          export PATH="$HOME/.cargo/bin:/opt/homebrew/opt/llvm/bin:/opt/homebrew/opt/lld/bin:/opt/homebrew/opt/bison/bin:$PATH"
+          # The Metal runtime build (Mesa Turnip and the translator) needs this Rust toolchain (aston's, the reference board's).
+          rustup toolchain install 1.98.0 --profile minimal --component rust-src
+          ok=1
+          for t in clang xcodebuild codesign git ninja cmake glslangValidator glslc spirv-val bison cargo; do
+            command -v "$t" >/dev/null || { echo "missing tool: $t"; ok=0; }
+          done
+          [ "$ok" = 1 ]
+          xcodebuild -version
+          echo "iphoneos SDK $(xcrun --sdk iphoneos --show-sdk-version)"
+          df -h "$GITHUB_WORKSPACE"
+      - name: plugin, addon and CDHashes
+        working-directory: UniXNU
+        run: |
+          python3 - <<'PY'
+          import hashlib, importlib.util, json, os
+          from pathlib import Path
+          root = Path.cwd()
+          spec = importlib.util.spec_from_file_location('runtime', root / 'scripts/build-boot-runtime.py')
+          runtime = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(runtime)
+          plugin = runtime.build_plugin('ios27')
+          out = Path(os.environ['GITHUB_WORKSPACE']) / 'plugin'
+          out.mkdir()
+          addon = out / 'gpuaddon.bin'
+          runtime.script('make-gpu-addon.py', '--publish', '--no-daemon', addon, env=dict(os.environ, ADRENO_PLUGIN_DIR=str(plugin)))
+          hashes = runtime.addon_hashes(addon, out / 'signed')
+          data = addon.read_bytes()
+          build = json.loads((plugin / 'NativeAdrenoMetal.bundle/gpu-build.json').read_text())
+          info = dict(target='ios27', unixnu='00f47f6875749dec49bb782718dff1de28006856', addon_bytes=len(data),
+                      addon_sha256=hashlib.sha256(data).hexdigest(), cdhashes=hashes, build=build,
+                      mesa=json.loads((root / 'scripts/data/adreno-compiler-inputs.json').read_text())['mesa']['commit'],
+                      translator=json.loads((root / 'scripts/data/gpu-metal-vulkan-inputs.json').read_text())['translator']['commit'])
+          (out / 'plugin.json').write_text(json.dumps(info, indent=2) + '\n')
+          print(json.dumps({k: v for k, v in info.items() if k != 'build'}, indent=2))
+          PY
+          rm -rf "$GITHUB_WORKSPACE/plugin/signed"
+      - name: record
+        run: |
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          info = json.load(open('plugin/plugin.json'))
+          print('### Adreno Metal plugin (iOS 27) GPU addon\n')
+          print(f"{info['addon_bytes']} bytes, sha256 `{info['addon_sha256']}`; {len(info['cdhashes'])} CDHashes for the owner trust module.\n")
+          print("Fetch on the PC: `bash scripts/ci-artifact.sh fetch <run-id> xueying-gpu-plugin`")
+          PY
+      - name: seal
+        run: bash UniXNU-xueying/scripts/opoios-ci-seal.sh xueying-gpu-plugin "$GITHUB_WORKSPACE/plugin" "$SEALED/plugin" gpuaddon.bin plugin.json
+      - name: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: xueying-gpu-plugin
+          retention-days: 7
+          if-no-files-found: error
+          path: ${{ env.SEALED }}/plugin/
+      - name: clean up
+        if: always()
+        run: rm -rf plugin sealed

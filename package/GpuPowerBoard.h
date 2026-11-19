@@ -402,6 +402,16 @@ out:
     gpb_rd(io, r, GPB_WIN_GPUCC, GPB_CC_PLL1 + GPB_PLL_OPMODE, &o->pll1_opmode);
 }
 
+// OPOIOS (xueying): this phone's Adreno 740 ZAP image. It is signed by the phone maker and TrustZone authenticates it (PAS 13), so
+// only this phone's image runs; it stays out of the repository and of the public CI. The owner's PC packs it into the GPU addon
+// under GPB_ZAP_ADDON_NAME (scripts/opoios-gpu-addon.py), and GpuPowerProbe.cpp takes it from there when the kernel's embedded ZAP
+// is empty, only if size and SHA-256 are these. Source: CPH2551 OxygenOS 16 /vendor/firmware/a740_zap.mbn (12088 bytes, the same
+// image as its split a740_zap.mdt + .b00..b02), read on 2026-11-19; pinned in scripts/data/xueying-gpu-inputs.json.
+#define GPB_ZAP_ADDON_NAME "firmware/a740_zap.mbn"
+#define GPB_ZAP_BYTES 12088u
+#define GPB_ZAP_SHA256 {0x77, 0xdf, 0x30, 0x65, 0xaf, 0x27, 0x9c, 0xa5, 0x75, 0x02, 0x12, 0xde, 0xb8, 0xe8, 0x53, 0x66, \
+                        0x75, 0x2d, 0xd7, 0x29, 0x74, 0xd8, 0xc3, 0x41, 0x7f, 0x8e, 0x1a, 0xd4, 0x17, 0xa6, 0xd7, 0xcc}
+
 // Formats the four status rows (47 characters each, space padded by the caller). Row text is the photo evidence.
 static inline const char *gpb_state_text(enum gpb_state s) {
     return s == GPB_DONE ? "ok" : s == GPB_SKIPPED_PREREQ ? "skip" : s == GPB_SKIPPED_MODE ? "off" : s == GPB_NOMAP ? "nomap" : "-";
