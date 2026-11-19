@@ -58,6 +58,7 @@
 extern "C" {
 #include "GpuPowerBoard.h"
 #include "GpuZapAddon.h"
+#include <libkern/zlib.h>
 }
 
 #include "NativeAdrenoGmuContext.h"
@@ -142,7 +143,6 @@ extern "C" const uint8_t native_adreno_zap_image[] __attribute__((weak));
 extern "C" const uint64_t native_adreno_zap_image_size __attribute__((weak));
 // OPOIOS: the GPU addon the loader handed over (drivers/RamBlock) and libkern's zlib, for the ZAP image the kernel does not embed.
 extern "C" int native_ram_block_gpu_addon(const uint8_t **, uint64_t *) __attribute__((weak_import));
-extern "C" int uncompress(unsigned char *, unsigned long *, const unsigned char *, unsigned long);
 extern "C" const uint8_t native_adreno_firmware_image[] __attribute__((weak));
 extern "C" const uint64_t native_adreno_firmware_image_size __attribute__((weak));
 extern "C" ShengGmuDbStatus ShengGmuCommandDbInputs(const uint8_t *, size_t, uint32_t, ShengGmuVoteInputs *) __attribute__((weak));
@@ -590,6 +590,40 @@ extern unsigned int vm_page_free_count __attribute__((weak));
 // -43 inflate, -44 SHA-256.
 int32_t native_gpu_zap_source;
 }
+// libkern's zlib has no default allocator: a z_stream without zalloc/zfree branches to a null pointer (store8, 2026-11-19: PAC
+// failure at inflateInit_+0x54 under uncompress, the GPU thread lost). As the kernel's own addon writer
+// (zzy-native-gpu-addon-mount.patch native_gpu_addon_zalloc), each block carries its size in a 16-byte header.
+voidpf zapZalloc(voidpf, uInt items, uInt size) {
+    if (size && items > (UINT32_MAX - 16) / size) return Z_NULL;
+    const size_t bytes = size_t(items) * size + 16;
+    uint8_t *block = static_cast<uint8_t *>(IOMallocData(bytes));
+    if (!block) return Z_NULL;
+    memcpy(block, &bytes, sizeof bytes);
+    return block + 16;
+}
+void zapZfree(voidpf, voidpf address) {
+    if (!address) return;
+    uint8_t *block = static_cast<uint8_t *>(address) - 16;
+    size_t bytes = 0;
+    memcpy(&bytes, block, sizeof bytes);
+    IOFreeData(block, bytes);
+}
+// The whole stream into exactly `size` bytes; 0 on success.
+int zapInflate(const uint8_t *packed, uint64_t packedBytes, uint8_t *out, uint32_t size) {
+    if (packedBytes > UINT32_MAX) return -1;
+    z_stream stream;
+    memset(&stream, 0, sizeof stream);
+    stream.zalloc = zapZalloc;
+    stream.zfree = zapZfree;
+    stream.next_in = const_cast<Bytef *>(packed);
+    stream.avail_in = uInt(packedBytes);
+    stream.next_out = out;
+    stream.avail_out = size;
+    if (inflateInit(&stream) != Z_OK) return -2;
+    const int result = inflate(&stream, Z_FINISH);
+    inflateEnd(&stream);
+    return result == Z_STREAM_END && stream.total_out == size && !stream.avail_in ? 0 : -3;
+}
 // OPOIOS (xueying): the ZAP image from the GPU addon, for a kernel built without one (the public CI never sees this phone's image).
 // Inflated once into kernel memory that lives for the boot (12 KiB), and used only if its size and SHA-256 are the pinned ones.
 const uint8_t *zapFromAddon(uint64_t *size) {
@@ -603,8 +637,7 @@ const uint8_t *zapFromAddon(uint64_t *size) {
     if (want != GPB_ZAP_BYTES) {native_gpu_zap_source = -41; return nullptr;}
     uint8_t *buffer = static_cast<uint8_t *>(IOMallocData(GPB_ZAP_BYTES));
     if (!buffer) {native_gpu_zap_source = -42; return nullptr;}
-    unsigned long out = GPB_ZAP_BYTES;
-    if (uncompress(buffer, &out, packed, (unsigned long)packedBytes) != 0 || out != GPB_ZAP_BYTES) {
+    if (zapInflate(packed, packedBytes, buffer, GPB_ZAP_BYTES)) {
         IOFreeData(buffer, GPB_ZAP_BYTES);
         native_gpu_zap_source = -43;
         return nullptr;
