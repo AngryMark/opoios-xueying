@@ -42,6 +42,10 @@ archives = [
   # OPOIOS stage 4: the RAM root store driver (OpoiosRootStoreDisk, OpoiosRootStore.c, the LZFSE decoder) into
   # build/opoios-root-store/libOpoiosRootStore.a; it needs the IOStorageFamily headers the step above prepares.
   "build-opoios-root-store.py",
+  # OPOIOS stage 4: RamBlock is the UniXNU submodule (60a54ce8 at the pinned UniXNU) with
+  # unixnu-patches/RamBlock/0001-volatile-large-disk-without-store.patch: a packed disk above 2 GiB (the 4 GiB Data seed) was
+  # served only through the persistent UFS store and refused every write without it ("disk3: device is not ready", phone run
+  # store3 2026-11-19). With no store mode (no data-persist) it now becomes the volatile sparse disk, writes in RAM.
   "component:RamBlock",
   "component:Adreno740",
   "fetch-sheng-dts.py",

@@ -1,0 +1,172 @@
+diff --git a/NativeRamBlock.cpp b/NativeRamBlock.cpp
+index fea4a30..3b513dc 100644
+--- a/NativeRamBlock.cpp
++++ b/NativeRamBlock.cpp
+@@ -198,6 +198,26 @@ class NativeRamBlock : public IOBlockStorageDevice {
+   };
+   IOReturn directReadWrite(IOMemoryDescriptor *buffer, uint64_t offset, uint64_t bytes, uint64_t *actual, uint64_t *waited);
+   void persistFailed() { overlay.active = false; native_data_persist_state = 5; __atomic_fetch_add(&native_data_persist_errors, 1, __ATOMIC_RELAXED); }
++  // Gate held. A disk above 2 GiB without a store had no write path: every write was answered NotReady for the whole boot. It becomes the
++  // volatile sparse disk a disk up to 2 GiB is: its seed pages move into a page table (8 bytes per 4 KiB page, 8 MiB for 4 GiB) and every
++  // write stays in RAM. The seed identity (seedHash) was taken at start and does not change. Without memory it stays as it was.
++  void makeVolatile() {
++    const uint64_t pages = big.bytes / 4096;
++    uint8_t **table = static_cast<uint8_t **>(IOMallocZero(pages * sizeof(uint8_t *)));
++    RamSparseDisk next = {};
++    if (!table || !seedToVolatile(big, next, table, pages)) {
++      if (table) IOFree(table, pages * sizeof(uint8_t *));
++      IOLog("NativeRamBlock: the %llu MiB disk has no store and could not be made volatile; writes stay refused\n", big.bytes >> 20);
++      return;
++    }
++    if (big.index) IOFree(big.index, (big.capacity ? big.capacity : 1) * sizeof(uint64_t));
++    if (big.page) IOFree(big.page, (big.capacity ? big.capacity : 1) * sizeof(uint8_t *));
++    big = {};
++    isBig = false;
++    sparse = next;
++    native_ram_block_resident_bytes = sparse.resident;
++    IOLog("NativeRamBlock: no persistent store; the %llu MiB disk is volatile, writes stay in RAM\n", sparse.bytes >> 20);
++  }
+ public:
+   // Called once, before the Data volume is mounted (native_ram_block_volume_seed): open the store window, put the pages that
+   // earlier boots changed back into the sparse disk, and from then on write changed pages through. The seed identity
+@@ -303,6 +323,9 @@ public:
+         native_data_persist_gpt_after = native_ufs_store_gpt_check();
+       }
+     }
++    // No store mode at all (no data-persist): a large disk is volatile like a small one. With a store mode that failed to open, it keeps
++    // waiting for the store as before.
++    if (!mode && isBig && !direct) makeVolatile();
+     IOLockUnlock(gate);
+   }
+ 
+diff --git a/SeedDisk.h b/SeedDisk.h
+index 5f5d374..603c092 100644
+--- a/SeedDisk.h
++++ b/SeedDisk.h
+@@ -66,6 +66,23 @@ template<class Ops> static bool seedImportSparse(SeedDisk &d, const uint8_t *p,
+   return true;
+ }
+ 
++// A large disk that gets no store (no data-persist: a board without persistent storage) becomes the volatile RamSparseDisk. table (pages
++// entries, zeroed, the caller's allocation) takes every seed page at its index; the pages change owner, so the SeedDisk is left empty
++// (count 0, its index and page arrays are still the caller's to free). The disk's content is unchanged. False, and nothing moved, without a
++// table, for a size that is not pages pages, or for indexes that are out of range or not strictly ascending.
++static bool seedToVolatile(SeedDisk &d, RamSparseDisk &s, uint8_t **table, uint64_t pages) {
++  if (!table || !pages || d.bytes != pages * 4096 || (d.count && (!d.index || !d.page))) return false;
++  for (uint64_t k = 0; k < d.count; ++k)
++    if (d.index[k] >= pages || !d.page[k] || (k && d.index[k] <= d.index[k - 1])) return false;
++  for (uint64_t k = 0; k < d.count; ++k) table[d.index[k]] = d.page[k];
++  s.pages = table;
++  s.bytes = d.bytes;
++  s.resident = d.resident;
++  d.count = 0;
++  d.resident = 0;
++  return true;
++}
++
+ // The identity of the seed for the persistent store: a disk of at most 2 GiB keeps the plain hash of all its bytes (as every earlier image and
+ // the offline checks use); a larger one hashes its size and its nonzero pages with their indexes, so that hashing a 200 GiB disk of zeros
+ // does not take minutes. Sha is a SHA-256 context type with init/update/final through the callbacks.
+diff --git a/Test/volatile.cpp b/Test/volatile.cpp
+new file mode 100644
+index 0000000..d1889a0
+--- /dev/null
++++ b/Test/volatile.cpp
+@@ -0,0 +1,97 @@
++// Host test of seedToVolatile (SeedDisk.h): a 4 GiB packed seed imported as a SeedDisk and moved into a RamSparseDisk page table reads
++// the same as the seed imported directly as a sparse disk, and takes writes in RAM through ramSparseIO. Standard C++ only.
++#include <cassert>
++#include <cstdio>
++#include <cstdlib>
++#include <map>
++#include <vector>
++#include "../SeedDisk.h"
++static std::vector<uint8_t> packed(uint64_t logical, const std::map<uint64_t, uint8_t> &pagesByIndex) {   // DBRDISK1, one extent per page
++  std::vector<uint8_t> out(32 + 16 * pagesByIndex.size());
++  memcpy(out.data(), "DBRDISK1", 8); uint32_t v = 1, ps = 4096; memcpy(&out[8], &v, 4); memcpy(&out[12], &ps, 4);
++  uint64_t count = pagesByIndex.size(); memcpy(&out[16], &logical, 8); memcpy(&out[24], &count, 8);
++  size_t k = 0;
++  for (auto &p : pagesByIndex) { uint64_t at = p.first * 4096, len = 4096; memcpy(&out[32 + 16 * k], &at, 8); memcpy(&out[40 + 16 * k], &len, 8); ++k; }
++  for (auto &p : pagesByIndex) out.insert(out.end(), 4096, p.second);
++  return out;
++}
++struct Ops {
++  std::vector<uint8_t> *data = nullptr;
++  unsigned allocations = 0;
++  uint8_t *allocate() { ++allocations; return (uint8_t *) calloc(1, 4096); }
++  uint64_t read(uint64_t at, void *p, uint64_t n) { memcpy(p, &(*data)[at], n); return n; }          // descriptor -> disk (a write)
++  uint64_t copy(uint64_t at, const void *p, uint64_t n) { memcpy(&(*data)[at], p, n); return n; }    // disk -> descriptor (a read)
++};
++static void freeSparse(RamSparseDisk &s) {
++  for (uint64_t i = 0; i < s.bytes / 4096; ++i) free(s.pages[i]);
++  free(s.pages); s = {};
++}
++
++int main() {
++  const uint64_t logical = 4ULL << 30, pages = logical / 4096;            // 4 GiB as the OPOIOS Data seed: the "big" path (> 2 GiB)
++  std::map<uint64_t, uint8_t> seedPages = {{0, 0x11}, {1, 0x12}, {1000, 0x13}, {pages / 2, 0x14}, {pages - 1, 0x15}};
++  auto blob = packed(logical, seedPages);
++  uint64_t count = 0;
++  assert(seedCountNonzero(blob.data(), blob.size(), &count) && count == 5);
++  SeedDisk seed; seed.bytes = logical; seed.capacity = count;
++  std::vector<uint64_t> index(count); std::vector<uint8_t *> page(count); seed.index = index.data(); seed.page = page.data();
++  Ops ops; assert(seedImportSparse(seed, blob.data(), blob.size(), ops) && seed.count == 5);
++
++  // Refusals move nothing: no table, wrong size, out-of-range or unordered indexes.
++  uint8_t **table = (uint8_t **) calloc(pages, sizeof(uint8_t *));
++  RamSparseDisk s = {};
++  assert(!seedToVolatile(seed, s, nullptr, pages) && !s.pages && seed.count == 5);
++  assert(!seedToVolatile(seed, s, table, pages - 1) && !s.pages && seed.count == 5);
++  { SeedDisk bad = seed; std::vector<uint64_t> ix(index); ix[4] = pages; bad.index = ix.data(); assert(!seedToVolatile(bad, s, table, pages) && bad.count == 5); }
++  { SeedDisk bad = seed; std::vector<uint64_t> ix(index); ix[2] = ix[1]; bad.index = ix.data(); assert(!seedToVolatile(bad, s, table, pages) && bad.count == 5); }
++  for (uint64_t i = 0; i < pages; ++i) assert(!table[i]);
++
++  // The move: every seed page at its index, ownership with the sparse disk, the SeedDisk empty.
++  const uint64_t resident = seed.resident;
++  assert(seedToVolatile(seed, s, table, pages));
++  assert(s.pages == table && s.bytes == logical && s.resident == resident && resident == 5 * 4096 && seed.count == 0 && seed.resident == 0);
++  // Same content as the seed imported straight into a sparse disk (the path a disk up to 2 GiB takes).
++  RamSparseDisk ref = {}; ref.bytes = logical; ref.pages = (uint8_t **) calloc(pages, sizeof(uint8_t *));
++  assert(ramSparseImport(ref, blob.data(), blob.size(), ops) && ref.resident == s.resident);
++  for (uint64_t i = 0; i < pages; ++i) {
++    assert(!s.pages[i] == !ref.pages[i]);
++    if (s.pages[i]) assert(!memcmp(s.pages[i], ref.pages[i], 4096));
++  }
++  freeSparse(ref);
++
++  // Reads through ramSparseIO: seed pages and zero pages, across a page boundary.
++  std::vector<uint8_t> buf(3 * 4096); ops.data = &buf; bool noMemory = false;
++  assert(ramSparseIO(s, false, 4096 - 512, 2 * 4096, ops, noMemory) == 2 * 4096 && !noMemory);
++  for (unsigned i = 0; i < 512; ++i) assert(buf[i] == 0x11);
++  for (unsigned i = 512; i < 512 + 4096; ++i) assert(buf[i] == 0x12);
++  for (unsigned i = 512 + 4096; i < 2 * 4096; ++i) assert(buf[i] == 0);
++  // Writes stay in RAM: a new page is allocated, a seed page is changed in place, partial pages keep the rest.
++  const unsigned before = ops.allocations;
++  memset(buf.data(), 0x77, buf.size());
++  assert(ramSparseIO(s, true, 5 * 4096 + 1024, 512, ops, noMemory) == 512);          // fresh page 5, partly
++  assert(ops.allocations == before + 1 && s.resident == resident + 4096 && s.pages[5]);
++  assert(ramSparseIO(s, true, 1000 * 4096, 4096, ops, noMemory) == 4096);              // seed page 1000, whole
++  assert(ops.allocations == before + 1 && s.resident == resident + 4096);
++  assert(ramSparseIO(s, true, logical - 512, 512, ops, noMemory) == 512);              // last sector of the disk
++  memset(buf.data(), 0, buf.size());
++  assert(ramSparseIO(s, false, 5 * 4096, 4096, ops, noMemory) == 4096);
++  for (unsigned i = 0; i < 4096; ++i) assert(buf[i] == ((i >= 1024 && i < 1536) ? 0x77 : 0));
++  assert(ramSparseIO(s, false, 1000 * 4096, 4096, ops, noMemory) == 4096);
++  for (unsigned i = 0; i < 4096; ++i) assert(buf[i] == 0x77);
++  assert(ramSparseIO(s, false, logical - 4096, 4096, ops, noMemory) == 4096);
++  for (unsigned i = 0; i < 4096; ++i) assert(buf[i] == (i >= 4096 - 512 ? 0x77 : 0x15));
++  // Out of range is refused, as for any sparse disk.
++  assert(ramSparseIO(s, true, logical, 512, ops, noMemory) == 0);
++  assert(ramSparseIO(s, true, logical - 512, 1024, ops, noMemory) == 0);
++
++  // An empty seed (all zero) moves too: no pages, every read zero, writes allocate.
++  { SeedDisk empty; empty.bytes = logical; RamSparseDisk e = {}; uint8_t **t = (uint8_t **) calloc(pages, sizeof(uint8_t *));
++    assert(seedToVolatile(empty, e, t, pages) && e.resident == 0);
++    assert(ramSparseIO(e, false, 0, 4096, ops, noMemory) == 4096);
++    for (unsigned i = 0; i < 4096; ++i) assert(buf[i] == 0);
++    freeSparse(e); }
++
++  freeSparse(s);
++  printf("volatile: ok (4 GiB seed, %llu pages moved, writes in RAM)\n", (unsigned long long) count);
++  return 0;
++}
