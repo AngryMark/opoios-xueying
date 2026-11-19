@@ -125,6 +125,32 @@ void opoios_image4_thread(char *out, size_t size);
 boolean_t ml_validate_nofault(vm_offset_t virtsrc, vm_size_t size);
 // drivers/QcomDwc3 (USB device mode, sheng-usb=1): its counters, see the index list at the top of QcomDwc3.cpp.
 extern volatile uint32_t native_usb_stats[54];
+// TouchProbe.cpp (sheng-touch=<n>, the GT9966): its stage, error and counters for the OPOIOS TCH row. Weak: the row reads them
+// only when they are linked.
+extern volatile uint32_t native_touch_stage_req __attribute__((weak_import)), native_touch_stage_done __attribute__((weak_import)),
+    native_touch_step __attribute__((weak_import)), native_touch_frames __attribute__((weak_import)),
+    native_touch_contacts __attribute__((weak_import)), native_touch_hid_reports __attribute__((weak_import));
+extern volatile int native_touch_error __attribute__((weak_import)), native_touch_last_x __attribute__((weak_import)),
+    native_touch_last_y __attribute__((weak_import));
+extern volatile uint32_t native_touch_irq_stats[4] __attribute__((weak_import)), native_touch_s3910[8] __attribute__((weak_import));
+extern char native_touch_rows[4][120] __attribute__((weak_import));
+}
+
+// OPOIOS: one row of the touch bring-up (TouchProbe.cpp), so the planned report shows it after iOS has taken the screen: stage
+// done/requested, step, error, interrupt state and count, polls, frames, contacts and the last one, HID reports, failures and the
+// last failure code, then the controller row (firmware ids, config, touch data address, last status). Reads without locks.
+static void opoios_touch_row(char *out, size_t size)
+{
+    if (!&native_touch_stage_req || !&native_touch_rows || !native_touch_stage_req) {
+        snprintf(out, size, "TCH off");
+        return;
+    }
+    snprintf(out, size, "TCH s%u/%u st%u e%d irq%u/%u n%u fr%u c%u %d,%d hid%u f%u/%d | %.110s",
+             (unsigned)native_touch_stage_done, (unsigned)native_touch_stage_req, (unsigned)native_touch_step,
+             (int)native_touch_error, (unsigned)native_touch_irq_stats[0], (unsigned)native_touch_irq_stats[1],
+             (unsigned)native_touch_s3910[0], (unsigned)native_touch_frames, (unsigned)native_touch_contacts,
+             (int)native_touch_last_x, (int)native_touch_last_y, (unsigned)native_touch_hid_reports,
+             (unsigned)native_touch_s3910[4], (int)native_touch_s3910[5], native_touch_rows[2] + 4);
 }
 
 // OPOIOS: AppleImage4's userspace cork and Image4's start (stage 3, device 2026-11-15). launchd waits in AppleImage4's sysctl
@@ -376,7 +402,7 @@ extern "C" unsigned opoios_screen_text(char *out, unsigned size)
 static void opoios_sys_report(void *argument, wait_result_t)
 {
     const unsigned limit = (unsigned)(uintptr_t)argument;
-    static char sys[640], pid1[160], image4[360], cached[200], trace[200], image4Thread[420], busy[480], store[200];
+    static char sys[640], pid1[160], image4[360], cached[200], trace[200], image4Thread[420], busy[480], store[200], touch[260];
     uint64_t at = 0;
     unsigned iteration = 0;
     for (unsigned elapsed = 0; elapsed < limit;) {
@@ -411,11 +437,14 @@ static void opoios_sys_report(void *argument, wait_result_t)
         opoios_root_store_row(store, sizeof store);
         opoios_report_mark = iteration * 10 + 7;
         printf("OPOIOS %s\n", store);
+        opoios_touch_row(touch, sizeof touch);
+        opoios_report_mark = iteration * 10 + 8;
+        printf("OPOIOS %s\n", touch);
         opoios_report_mark = iteration * 10 + 9;
     }
     opoios_report_mark = 1000;
-    panic("%s\nOPOIOS I4T %s\nOPOIOS LD %s | %s\nOPOIOS SAMPLE at %llus step %u | %s\n%s\nOPOIOS %s\nOPOIOS %s", image4, image4Thread,
-          cached, trace, (unsigned long long)at, (unsigned)opoios_sampler_step, pid1, sys, busy, store);
+    panic("%s\nOPOIOS I4T %s\nOPOIOS LD %s | %s\nOPOIOS SAMPLE at %llus step %u | %s\n%s\nOPOIOS %s\nOPOIOS %s\nOPOIOS %s", image4,
+          image4Thread, cached, trace, (unsigned long long)at, (unsigned)opoios_sampler_step, pid1, sys, busy, store, touch);
 }
 
 static void opoios_sys_report_start(void)

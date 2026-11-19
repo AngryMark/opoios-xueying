@@ -493,8 +493,9 @@ run([llvm / 'llvm-objcopy', '--remove-section=__DATA,__mod_init_func', '--global
      SRC / 'NativeHidInput.o', hid_late])
 hid_probe = ROOT / 'kits/sheng/HidInputProbe.cpp'
 compile_cpp(hid_probe, OUT / 'HidInputProbe.o')
+# OPOIOS (xueying): the touch protocol object is GoodixBerlin (GT9966), not aston's S3910 (build-aston-source-drivers.py).
 input_objects = [hid_late, OUT / 'hid-bindings.o', OUT / 'hid-addresses.o', OUT / 'HidInputProbe.o'] + \
-    [SRC / (stem + '.o') for stem in ('TouchProbe', 'ButtonProbe', 'GeniSpi', 'S3910')]
+    [SRC / (stem + '.o') for stem in ('TouchProbe', 'ButtonProbe', 'GeniSpi', 'GoodixBerlin')]
 print(f'HID: {len(hid_bindings)} original IOHIDDevice bindings, vtables {hid_vtables} match the original diversities')
 # The iPadOS 17 board drivers, unchanged: CPU frequency, WiFi, audio DSP (and the battery manager on it), speaker and microphone,
 # brightness, battery and panel timing. Their classes derive from xnu's own (IOService, IOUserClient, IOPMPowerSource), so the native

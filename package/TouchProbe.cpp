@@ -1,17 +1,20 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-// OnePlus Ace 3 (aston): default-off staged bring-up of the Synaptics S3910 touch controller on QUP1 SE4. `sheng-touch=<n>`:
+// OnePlus Open (xueying): default-off staged bring-up of the Goodix GT9966 touch controller of the inner panel on QUP1 SE4, the
+// serial engine, pins, rail and GPIOs that aston's Synaptics S3910 uses on the OnePlus Ace 3 (this file is aston's, with the
+// protocol swapped). `sheng-touch=<n>`:
 //   1  read-only snapshot of the GCC branches, the S4 DFS levels and the touch pins
 //   2  vote the QUP clocks, wait for them, configure the SPI pins, read the GENI engine identity
-//   3  GENI SPI init and clock; power (ldob4 through RPMh, AVDD on GPIO 10) and reset (GPIO 24) the controller; identify it and
-//      select on-controller (LBP) contact reports (S3910.c, the TouchComm v1/v2 implementation of the OnePlus 13T port)
-//   4  report loop: the ATTN line (GPIO 25, active low) wakes the thread, contacts go to ShengHidInput through native_touch_*
-// The transport (clock votes, pins, SE DMA behind an SMMU bypass, the TLMM summary interrupt) is the reference board's: its
-// Novatek controller sits on the same serial engine and pins. The controller firmware stays in the S3910's flash; nothing is
-// downloaded or erased. Every stage reports on the diagnostic page; the first failure stops the sequence. Nothing here is
-// validated on the device until a boot has shown it. Board constants and their sources are in TouchBoard.h.
+//   3  GENI SPI init and clock; power (VDDI = ldob4 through RPMh, AVDD on GPIO 10) and reset (GPIO 24) the controller; read its
+//      firmware version and IC information (GoodixBerlin.c: no write)
+//   4  report loop: the INT line (GPIO 25, a falling pulse per event) wakes the thread, contacts go to ShengHidInput through
+//      native_touch_*; after each event GoodixBerlin.c writes one 0 to the touch data buffer, its only write
+// The transport (clock votes, pins, SE DMA behind an SMMU bypass, the TLMM summary interrupt) is the reference board's. The
+// controller firmware and config stay in the GT9966's flash as OxygenOS left them; nothing is downloaded, erased or configured.
+// Every stage reports on the diagnostic page and in the OPOIOS TCH row of the planned report; the first failure stops the
+// sequence. Nothing here is validated on the device until a boot has shown it. Board constants are in TouchBoard.h.
 //
 // Other arguments: sheng-touch-hz (SPI clock), sheng-touch-flip (bit 0 mirror X, bit 1 mirror Y, bit 2 swap the axes),
-// sheng-touch-poll=1 (sample ATTN every 8 ms instead of waiting for its interrupt), sheng-touch-delay=<SE_SPI_DELAY_COUNTERS>,
+// sheng-touch-poll=1 (read the touch data every 8 ms instead of waiting for INT), sheng-touch-delay=<SE_SPI_DELAY_COUNTERS>,
 // sheng-touch-rail=0 (no RPMh request for ldob4: the rail is assumed on).
 #include <IOKit/IOService.h>
 #include <IOKit/IOLib.h>
@@ -27,7 +30,7 @@
 #include "AppsSmmuLock.h"
 extern "C" {
 #include "GeniSpi.h"
-#include "S3910.h"
+#include "GoodixBerlin.h"
 #include "QcomRpmh.h"
 #include "TouchBoard.h"
 #include "TouchTrace.h"
@@ -54,14 +57,14 @@ volatile int native_touch_xs[TOUCH_SLOTS], native_touch_ys[TOUCH_SLOTS], native_
 volatile int32_t native_touch_strokes[16][7];
 volatile uint32_t native_touch_stroke_count;
 volatile int32_t native_touch_extent[4] = {0x7fffffff, -1, 0x7fffffff, -1};
-// Counters the reference Novatek core filled; BootLog.c reads them, the S3910 path leaves them zero.
+// Counters the reference Novatek core filled; BootLog.c reads them, the Goodix path leaves them zero.
 volatile uint32_t native_touch_jitter[3];
 volatile uint32_t native_touch_hold[14];
 volatile uint32_t native_swipe_stats[16];
 // [0] 0 not armed, 1 armed, 2 attach failed, [1] interrupts, [2] spurious, [3] attach status
 volatile uint32_t native_touch_irq_stats[4];
-// S3910 loop: [0] reads, [1] contact reports, [2] other reports, [3] restarts recovered, [4] transport/protocol failures,
-// [5] last failure code, [6] ATTN wait ms at start, [7] reported maxima x << 16 | y
+// Controller loop (the name is aston's; GT9966 here): [0] polls, [1] touch frames, [2] other events, [3] reset requests honoured,
+// [4] transport/protocol failures, [5] last failure code, [6] INT level after reset, [7] touch data address
 volatile uint32_t native_touch_s3910[8];
 }
 
@@ -88,8 +91,9 @@ void wr32(uintptr_t base, uint32_t reg, uint32_t value) {
 // The serial engine's DMA master reads and writes two 64 KiB buffers through the same pass-through mapping the UFS driver uses.
 // Caches are maintained explicitly.
 constexpr size_t kDmaBytes = 64 * 1024;
-// One S3910 packet: at most S3910_PAYLOAD_MAX + 7 bytes read (v1 body with its trailer) or S3910_PAYLOAD_MAX + 6 written.
-constexpr size_t kBufBytes = 1024;
+// The largest Goodix transfer is the IC information read: GB_XFER_MAX (1032) bytes.
+constexpr size_t kBufBytes = 2048;
+static_assert(kBufBytes >= GB_XFER_MAX, "touch buffers hold the IC information read");
 void cacheRange(void *p, size_t len, int op) {   // 0 clean, 1 clean+invalidate, 2 invalidate
     uint64_t ctr;
     __asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
@@ -140,7 +144,7 @@ struct Session {
     uint8_t loopRx[8];
     struct geni_spi spi;
     uint8_t *tx = nullptr, *rx = nullptr;
-    struct s3910 tc;
+    struct gb gt;
     uint32_t vals[40];
     int lastRc = 0;
     uint32_t lastLen = 0, xIrq = 0, xGeni = 0, xTx = 0, xRx = 0;
@@ -173,22 +177,14 @@ int busXfer(void *ctx, const uint8_t *tx, uint8_t *rx, size_t len) {
     return rc;
 }
 
-// The S3910 bus: one full-duplex transfer per call with chip select held throughout. Reads clock out 0xff, as the vendor driver does.
-int tcRead(void *ctx, uint8_t *buf, size_t len) {
+// The Goodix bus: one full-duplex transfer per call with chip select held throughout. GoodixBerlin.c builds its frames in the
+// session's tx and rx buffers (gt.tx, gt.rx), so they go to the engine as they are.
+int gtXfer(void *ctx, const uint8_t *tx, uint8_t *rx, size_t len) {
     Session *s = static_cast<Session *>(ctx);
     if (!len || len > kBufBytes) return -90;
-    memset(s->tx, 0xff, len);
-    const int rc = busXfer(s, s->tx, s->rx, len);
-    if (!rc) memcpy(buf, s->rx, len);
-    return rc;
+    return busXfer(s, tx, rx, len);
 }
-int tcWrite(void *ctx, const uint8_t *buf, size_t len) {
-    Session *s = static_cast<Session *>(ctx);
-    if (!len || len > kBufBytes) return -90;
-    memcpy(s->tx, buf, len);
-    return busXfer(s, s->tx, s->rx, len);
-}
-void tcSleep(void *, unsigned ms) {IOSleep(ms);}
+void gtSleep(void *, unsigned ms) {IOSleep(ms);}
 
 void fail(unsigned step, int code) {
     if (!native_touch_error) {native_touch_step = step; native_touch_error = code ? code : -1;}
@@ -247,10 +243,11 @@ void rows(const Session &s) {
         "TCH p%08x %08x %08x %08x attn%08x rst%08x avdd%08x fw%08x if%08x L%u/%u %uHz",
         v[9], v[10], v[11], v[12], v[13], v[20], v[21], v[15], v[16], s.level, s.div, (unsigned)s.actualHz);
     snprintf(native_touch_rows[2], sizeof native_touch_rows[2],
-        "TCH S3910 v%u m%u %ux%u wr%u rd%u %s %08x c%02x/%02x fr%u c%u %d,%d hid%u",
-        s.tc.version, s.tc.mode, s.tc.max_x, s.tc.max_y, s.tc.max_write, s.tc.max_read, s.tc.stage ? s.tc.stage : "-",
-        s.tc.detail, s.tc.command, s.tc.code, native_touch_frames, native_touch_contacts, native_touch_last_x, native_touch_last_y,
-        native_touch_hid_reports);
+        "TCH GT %s/%s v%02x%02x%02x%02x s%u cfg%08x/%u %ux%u ta%05x st%02x %s %d fr%u c%u %d,%d hid%u",
+        s.gt.rom_pid, s.gt.patch_pid, s.gt.patch_vid[0], s.gt.patch_vid[1], s.gt.patch_vid[2], s.gt.patch_vid[3], s.gt.sensor_id,
+        s.gt.config_id, s.gt.config_version, s.gt.drv_num, s.gt.sen_num, s.gt.touch_addr, s.gt.status,
+        s.gt.stage ? s.gt.stage : "-", (int)s.gt.detail, native_touch_frames, native_touch_contacts, native_touch_last_x,
+        native_touch_last_y, native_touch_hid_reports);
     snprintf(native_touch_rows[3], sizeof native_touch_rows[3],
         "TCH xf rc%d n%u ev%08x gs%08x tx%08x rx%08x sm%d/%d/e%d pa%llx vdd%d a%05x drv%08x p%u dly%x",
         s.lastRc, s.lastLen, s.xIrq, s.xGeni, s.xTx, s.xRx, s.smmuSlot, s.smmuBank, s.smmuErr, (unsigned long long)s.dmaPhys,
@@ -296,16 +293,17 @@ void trackStrokes(unsigned count, const int *ids, const int *xs, const int *ys) 
 static void (*gTouchSink)(void *);
 static void *gTouchSinkContext;
 unsigned gFlip;
-// Publishes the active contacts of one S3910 frame. S3910.c normalises each axis to 0..32767 over the controller's own maxima; X is
-// the panel's short axis, which is also the framebuffer's width (1264 x 2780 portrait), so no rotation is needed. The values are
+// Publishes the active contacts of one GT9966 frame. The controller reports panel units (touchpanel,panel-coords 22680 x 24400
+// over the 2268 x 2440 inner panel: X is its width, as the framebuffer's); each axis is normalised to 0..32767 over them, then
 // rescaled to the axis maxima ShengHidInput normalises against (TB_HID_X_MAX x TB_HID_Y_MAX). Contact IDs 0..9 become 1..10.
-void publish(const struct s3910_frame &frame) {
+int panelAxis(unsigned v, unsigned max) {return static_cast<int>((v >= max ? max - 1 : v) * 32767ull / (max - 1));}
+void publish(const struct gb_frame &frame) {
     int ids[TOUCH_SLOTS], xs[TOUCH_SLOTS], ys[TOUCH_SLOTS];
     unsigned count = 0;
-    for (unsigned id = 0; id < S3910_CONTACTS && count < TOUCH_SLOTS; ++id) {
-        const struct s3910_contact &c = frame.contact[id];
+    for (unsigned id = 0; id < GB_CONTACTS && count < TOUCH_SLOTS; ++id) {
+        const struct gb_contact &c = frame.contact[id];
         if (!c.active) continue;
-        int x = c.x, y = c.y;
+        int x = panelAxis(c.x, TB_PANEL_X_MAX), y = panelAxis(c.y, TB_PANEL_Y_MAX);
         if (gFlip & 4) {const int t = x; x = y; y = t;}
         if (gFlip & 1) x = 32767 - x;
         if (gFlip & 2) y = 32767 - y;
@@ -331,7 +329,7 @@ void publish(const struct s3910_frame &frame) {
 }
 // Lifts every contact (transport failure, controller restart): the HID layer sends tip-up for each identifier that vanished.
 void releaseAll() {
-    struct s3910_frame none;
+    struct gb_frame none;
     memset(&none, 0, sizeof none);
     publish(none);
 }
@@ -520,44 +518,47 @@ void pinOut(const Region &pin, unsigned high) {
     wr32(pin.va, 0, tb_gpio_cfg(0, TB_DRIVE_8MA, 1));      // GPIO function, no pull, output
 }
 
-// The vendor sequence (synaptics_tcm hbp power and reset): vdd, AVDD high, 200 ms, reset low 10 ms, reset high, 80 ms.
+void resetPulse(Session &s) {
+    pinOut(s.tlmmReset, 0);
+    IOSleep(TB_RESET_ACTIVE_MS);
+    pinOut(s.tlmmReset, 1);
+    IOSleep(TB_RESET_DELAY_MS);
+}
+
+// The vendor sequence (OnePlus goodix_brl_core.c goodix_power_control and goodix_reset): VDDI, 10 ms, AVDD, 10 ms, reset low
+// 15 ms, reset high, 150 ms. The reset line is held low from the start, so the controller never runs on a half-up supply.
 bool powerUp(Session &s) {
     mark(s, 6);
-    wr32(s.tlmmIrq.va, 0, tb_gpio_cfg(3, TB_DRIVE_8MA, 0));   // ATTN: GPIO input with a pull-up (ts_int_active)
+    wr32(s.tlmmIrq.va, 0, tb_gpio_cfg(3, TB_DRIVE_8MA, 0));   // INT: GPIO input with a pull-up (ts_int_active)
     pinOut(s.tlmmReset, 0);                                     // hold the controller in reset while its supplies come up
     unsigned rail = 1;
     PE_parse_boot_argn("sheng-touch-rail", &rail, sizeof rail);
     s.railRc = rail ? railOn(s) : 0;
     if (s.railRc) {fail(6, s.railRc); return false;}
+    IOSleep(TB_VDDI_DELAY_MS);
     pinOut(s.tlmmAvdd, 1);
-    IOSleep(TB_POWER_DELAY_MS);
-    IOSleep(TB_RESET_ACTIVE_MS);
-    pinOut(s.tlmmReset, 1);
-    IOSleep(TB_RESET_DELAY_MS);
+    IOSleep(TB_AVDD_DELAY_MS);
+    resetPulse(s);
     s.vals[13] = rd32(s.tlmmIrq.va, 4) | rd32(s.tlmmIrq.va, 0) << 8;
     s.vals[20] = rd32(s.tlmmReset.va, 4) | rd32(s.tlmmReset.va, 0) << 8;
     s.vals[21] = rd32(s.tlmmAvdd.va, 4) | rd32(s.tlmmAvdd.va, 0) << 8;
-    // After reset the controller asserts ATTN with its identify report.
-    unsigned waited = 0;
-    while ((rd32(s.tlmmIrq.va, 4) & 1) && waited < 1000) {IOSleep(5); waited += 5;}
-    native_touch_s3910[6] = waited;
+    native_touch_s3910[6] = rd32(s.tlmmIrq.va, 4) & 1;          // INT idles high; GT9966 pulses it low per event
     return true;
 }
 
-// Identify the controller and select LBP contact reports; one controller reset and a second attempt on failure.
+// Read the firmware version and the IC information; one controller reset and a second attempt on failure. No write.
 bool startController(Session &s) {
     for (unsigned attempt = 0; attempt < 2; ++attempt) {
         mark(s, 7);
-        s.tc.bus = (struct s3910_bus){&s, tcRead, tcWrite, tcSleep};
-        const int rc = s3910_start(&s.tc);
-        native_touch_s3910[7] = (uint32_t)s.tc.max_x << 16 | s.tc.max_y;
+        s.gt.bus = (struct gb_bus){&s, gtXfer, gtSleep};
+        s.gt.tx = s.tx;
+        s.gt.rx = s.rx;
+        const int rc = gb_start(&s.gt);
+        native_touch_s3910[7] = s.gt.touch_addr;
         if (!rc) return true;
         native_touch_s3910[5] = (uint32_t)rc;
         if (attempt) {fail(7, rc); return false;}
-        pinOut(s.tlmmReset, 0);
-        IOSleep(TB_RESET_ACTIVE_MS);
-        pinOut(s.tlmmReset, 1);
-        IOSleep(TB_RESET_DELAY_MS);
+        resetPulse(s);
     }
     return false;
 }
@@ -566,14 +567,14 @@ bool startController(Session &s) {
 // The ATTN interrupt (GPIO 25): registers per pin at TLMM + 0x1000 * pin as pinctrl-msm.c defines them: +0x4 IN_OUT (bit 0 the level),
 // +0x8 INTR_CFG (bit 0 enable, bit 1 polarity, bits 3:2 detection 0 level / 1 rising / 2 falling / 3 both, bit 4 raw status enable,
 // bits 7:5 target, 3 = the application processor), +0xc INTR_STATUS (bit 0; acknowledged by writing 0). All TLMM pin interrupts share
-// the summary SPI 208 (INTID 240). The S3910 drives ATTN low while a report is pending (irq-on-state 0), so the edge is the falling one.
+// the summary SPI 208 (INTID 240). GT9966: irq-gpio = <&tlmm 25 0x2002>, a falling pulse per event, so the edge is the falling one.
 extern "C" int armcpu_spi_attach(uint32_t, bool, void (*)(void *), void *, uint32_t *, uint64_t *) __attribute__((weak_import));
 extern "C" int armcpu_spi_share(uint32_t, void (*)(void *), void *) __attribute__((weak_import));
 static volatile uint32_t gTouchIrqEvents;
 static volatile uint32_t *gTouchPin;
 
 extern "C" void native_touch_set_sink(void (*sink)(void *), void *context) {gTouchSinkContext = context; __atomic_store_n(&gTouchSink, sink, __ATOMIC_RELEASE);}
-// The reference board's path trace (sheng-tlog) records Novatek tracking state; the S3910 path has none.
+// The reference board's path trace (sheng-tlog) records Novatek tracking state; the Goodix path has none.
 extern "C" const touch_trace_row *sheng_touch_trace_freeze(uint32_t *total) {if (total) *total = 0; return nullptr;}
 
 static void touchIrq(void *) {
@@ -648,7 +649,7 @@ static void touchThread(void *, wait_result_t) {
         unsigned rowTick = 0, failures = 0;
         for (;;) {
             native_touch_loop_step = 1;
-            // Wait for ATTN; while a finger is down, wake every 8 ms anyway so a missed edge never holds a contact.
+            // Wait for INT; while a finger is down, wake every 8 ms anyway so a missed pulse never holds a contact.
             if (irqArmed && !down) {
                 assert_wait_timeout((event_t)&gTouchIrqEvents, THREAD_UNINT, 100, kMillisecondScale);
                 if (gTouchIrqEvents != seen) clear_wait(current_thread(), THREAD_AWAKENED);
@@ -657,10 +658,12 @@ static void touchThread(void *, wait_result_t) {
                 IOSleep(8);
             }
             seen = gTouchIrqEvents;
-            for (unsigned n = 0; n < 32 && !(rd32(s->tlmmIrq.va, 4) & 1); ++n) {   // every report pending now
+            // GT9966 pulses INT once per event and holds the event until it is cleared, so the level says nothing: read the
+            // buffer until it is empty (a few events at most arrive while one is read).
+            for (unsigned n = 0; n < 4; ++n) {
                 native_touch_loop_step = 2;
-                struct s3910_frame frame;
-                const int rc = s3910_poll(&s->tc, &frame);
+                struct gb_frame frame;
+                const int rc = gb_poll(&s->gt, &frame);
                 native_touch_s3910[0] = native_touch_s3910[0] + 1;
                 if (rc == 1) {
                     native_touch_loop_step = 3;
@@ -672,16 +675,24 @@ static void touchThread(void *, wait_result_t) {
                     failures = 0;
                     continue;
                 }
-                if (rc == 0) {native_touch_s3910[2] = native_touch_s3910[2] + 1; continue;}
-                native_touch_s3910[5] = (uint32_t)rc;
+                if (rc == 0) {
+                    if (s->gt.status) native_touch_s3910[2] = native_touch_s3910[2] + 1;   // another event, cleared
+                    break;
+                }
                 if (down) {releaseAll(); down = false;}
-                if (rc == -104 && startController(*s)) {native_touch_s3910[3] = native_touch_s3910[3] + 1; break;}
+                if (rc == 2) {   // the controller asks for a reset: reset it and identify it again
+                    resetPulse(*s);
+                    if (startController(*s)) {native_touch_s3910[3] = native_touch_s3910[3] + 1; break;}
+                    failures = 20;
+                    break;
+                }
+                native_touch_s3910[5] = (uint32_t)rc;
                 native_touch_s3910[4] = native_touch_s3910[4] + 1;
                 ++failures;
                 IOSleep(20);
                 break;
             }
-            // The controller reports a lift as a contact report without that contact, so a held contact needs no timeout here.
+            // The controller reports a lift as a touch event without that contact, so a held contact needs no timeout here.
             if (failures >= 20) {fail(11, (int)native_touch_s3910[5]); break;}
             if ((++rowTick & 63) == 0) rows(*s);
         }

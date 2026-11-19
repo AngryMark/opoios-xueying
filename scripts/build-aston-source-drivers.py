@@ -2,8 +2,9 @@
 """Compile aston storage/input against pinned public source interfaces.
 
 The OnePlus Ace 3 copy of UniXNU scripts/build-sheng-source-drivers.py (UniXNU
-82b847c4ac3f68a57024b3082ffa3a03442defd9). Differences: the touch transport is
-the Synaptics S3910 TouchComm core (package/S3910.c), which keeps its firmware in
+82b847c4ac3f68a57024b3082ffa3a03442defd9). Differences: the touch protocol is
+OPOIOS' Goodix Berlin core (package/GoodixBerlin.c, the OnePlus Open's GT9966;
+aston built the Synaptics S3910 TouchComm core here), which keeps its firmware in
 the controller's flash, so no firmware object is generated; the shared sources,
 helpers and OS profiles come from the UniXNU checkout that holds --tree
 (out/<device>/<os>/<config>/tree), because this copy runs from the tree.
@@ -136,12 +137,13 @@ def main():
             '-DNATIVE_VERIFIED_BLOCK=1', '-DNATIVE_VERIFIED_BLOCK_MULTI_POLICY=1',
             '-I', str(ROOT / 'kits/VerifiedRoot/include'), '-I', str(ROOT / 'drivers/VirtioMmioBlock')])],
         'ShengHidInput': [(device / 'drivers/ShengHidInput/NativeHidInput.cpp', ['-DNATIVE_HID_SOURCE_API=1'])],
-        # S3910 touch (TouchComm v1/v2 core, TouchBoard.h board values) and the PMIC keys. TouchProbe.cpp includes S3910.h,
-        # TouchBoard.h and the SM8550 helpers from package/, its own directory.
+        # OPOIOS (xueying): GT9966 touch (GoodixBerlin.c, the Goodix Berlin SPI protocol; TouchBoard.h board values) and the PMIC
+        # keys. TouchProbe.cpp includes GoodixBerlin.h, TouchBoard.h and the SM8550 helpers from package/, its own directory.
+        # aston's S3910.c stays in package/ but is not built: this phone has no Synaptics controller.
         'ShengInputTransport': [(device / 'package/TouchProbe.cpp', ['-I', str(ROOT / 'drivers/QcomGeniSpi')]),
             (device / 'package/ButtonProbe.cpp', []),
             (ROOT / 'drivers/QcomGeniSpi/GeniSpi.c', []),
-            (device / 'package/S3910.c', [])],
+            (device / 'package/GoodixBerlin.c', [])],
     }
     generation = None
     if args.with_storage_family:

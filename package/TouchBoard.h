@@ -46,22 +46,28 @@
 #define TB_GPIO_SPI_MOSI 45
 #define TB_GPIO_SPI_CLK 46
 #define TB_GPIO_SPI_CS 47
-#define TB_GPIO_IRQ 25                        // aston: synaptics,irq-gpio = <&tlmm 25 0x2008> (ATTN, active low)
+#define TB_GPIO_IRQ 25                        // GT9966 irq-gpio = <&tlmm 25 0x2002>: INT, a falling pulse per event
 #define TB_FUNC_QUP1_SE4 1                    // PINGROUP(44..47, qup1_se4, ...): function slot 1
 #define TB_DRIVE_6MA 2                        // drive-strength = <6>: 2 mA steps encoded as (mA/2)-1
 #define TB_DRIVE_8MA 3
-#define TB_SPI_MODE 0                         // aston: synaptics,spi-mode = <0>
-#define TB_SPI_DEFAULT_HZ 19000000u   // aston: spi-max-frequency = <19000000>
+#define TB_SPI_MODE 0                         // GT9966: SPI mode 0 (both Goodix Berlin drivers)
+// OPOIOS (xueying): goodix_gt9966@0 spi-max-frequency = <12000000> (the phone's live DT; spi@a90000 itself allows 50 MHz).
+#define TB_SPI_DEFAULT_HZ 12000000u
 #define TB_SPI_MAX_HZ 19200000u
 
-// ---- OnePlus Ace 3 (aston, project 23801) Synaptics S3910 on the same QUP1 SE4 as the reference board ----
-// tp/aston-oplus_tp-23801.dtsi synaptics_tcm_hbp@0 and salami_overlay_common.dtsi pinctrl (oneplus/sm8550_v_15.0.0_ace_3 4498f99b).
-#define TB_GPIO_RESET 24                      // synaptics,reset-gpio = <&tlmm 24 0x1>; ts_reset_active: 8 mA, bias-disable
-#define TB_GPIO_AVDD 10                       // synaptics,avdd-gpio = <&tlmm 10 0x1>, power-on-state 1: drive high to enable AVDD
-#define TB_POWER_DELAY_MS 200                 // synaptics,power-delay-ms
-#define TB_RESET_ACTIVE_MS 10                 // synaptics,reset-active-ms (reset-on-state 0: low while active)
-#define TB_RESET_DELAY_MS 80                  // synaptics,reset-delay-ms
-// vdd-supply = <&L4B>: PM8550 (PMIC B) LDO 4, RPMh VRM "ldob4". The vendor regulator default is 1.8 V.
+// ---- OnePlus Open (xueying, project 22899) Goodix GT9966 of the inner panel, wired as aston's S3910 on the OnePlus Ace 3 ----
+// The phone's live DT (OxygenOS 16, inventory 2026-11-14): spi@a90000 (QUP1 SE4, pins gpio44..47 qup1_se4_l0..l3), goodix_gt9966@0
+// irq-gpio = <&tlmm 25 0x2002>, reset-gpio = <&tlmm 24 1>, enable2v8_gpio = <&tlmm 10 1> (AVDD), vcc_1v8-supply = pm_humu_l4
+// (ldob4, 1.8 V); pins ts_avdd_active_primary gpio10, ts_int_active_primary gpio25 (pull-up), ts_reset_active_primary gpio24.
+// aston's values (tp/aston-oplus_tp-23801.dtsi synaptics_tcm_hbp@0) are the same pins and rail.
+#define TB_GPIO_RESET 24                      // reset-gpio = <&tlmm 24 1>: driven low to hold the controller in reset
+#define TB_GPIO_AVDD 10                       // enable2v8_gpio = <&tlmm 10 1>: drive high to enable AVDD
+// OnePlus goodix_brl_core.c: VDDI, 10 ms, AVDD, 10 ms (goodix_power_control), reset low 15 ms, high, 50 + 100 ms (goodix_reset).
+#define TB_VDDI_DELAY_MS 10
+#define TB_AVDD_DELAY_MS 10
+#define TB_RESET_ACTIVE_MS 15
+#define TB_RESET_DELAY_MS 150
+// vcc_1v8-supply = pm_humu_l4: PM8550 (PMIC B) LDO 4, RPMh VRM "ldob4" (qcom,resource-name), 1.8 V (min = max = 1800000 uV).
 #define TB_VDD_RESOURCE "ldob4"
 #define TB_VDD_MV 1800
 // Apps RSC DRV 2 (kalama.dtsi apps_rsc drv-2), TCS block at +0xd00; AOP command database (aop_cmd_db_region@81c60000).
@@ -80,10 +86,10 @@
 #define TB_SPI_DELAY_COUNTERS 0x278
 #define TB_SPI_CS_DELAY 50
 #define TB_SPI_WORD_DELAY 0
-// Touch coordinate space (touchpanel,panel-coords = <20224 44480>) over the 1264 x 2780 portrait panel: X is the short axis.
-// S3910 reports its own maxima in the application info; these are the expected values, checked on the diagnostic page.
-#define TB_S3910_MAX_X 20224
-#define TB_S3910_MAX_Y 44480
+// Touch coordinate space of the GT9966: touchpanel,panel-coords = <22680 24400> over touchpanel,display-coords = <2268 2440>, the
+// inner panel the ABL splash (and so iOS) is on: X is the panel's width.
+#define TB_PANEL_X_MAX 22680
+#define TB_PANEL_Y_MAX 24400
 // ShengHidInput normalises published coordinates against these maxima (30480 x 20320, the reference panel's axes).
 #define TB_HID_X_MAX 30480
 #define TB_HID_Y_MAX 20320
