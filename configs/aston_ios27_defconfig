@@ -12,18 +12,22 @@ CONFIG_XNU_SOURCE_STORAGE_TABLES="userdata"
 CONFIG_XNU_SOURCE_STORAGE=y
 CONFIG_XNU_OWNER_ROOT_AUDIT=y
 CONFIG_XNU_OWNER_ROOT_TRUST=y
-# The loader's RAM disk as a block device (stage 3: the restore ramdisk is the root, started by opoios-ram-root=1).
+# The loader's RAM disk as a block device: the Data seed (started by opoios-ram-root=2).
 CONFIG_XNU_NATIVE_RAM_BLOCK=y
-# OPOIOS stage 3: no owner SystemOS cryptex, boot manifest or Data volume. aston mounts them in load_init_program before
-# launchd (a full iOS root on UFS with a Data seed); the restore ramdisk has none, and on the device (2026-11-15) the boot
-# stopped there with "offline owner SystemOS mount failed" (kern_exec.c) right after the RAM root mounted. Off as a chain:
-# DATA_MOUNT needs BOOT_MANIFEST, which needs CACHE_STARTUP, which needs CACHE_MOUNT; UNION_SYSTEMOS needs CACHE_STARTUP.
-# Turn them back on with the full OS root (stage 4), together with CONFIG_XNU_OWNER_DATA_VOLUME_UUID of that Data seed.
-CONFIG_XNU_OWNER_CACHE_MOUNT=n
-CONFIG_XNU_OWNER_CACHE_STARTUP=n
-CONFIG_XNU_OWNER_BOOT_MANIFEST=n
-CONFIG_XNU_OWNER_DATA_MOUNT=n
-CONFIG_XNU_OWNER_UNION_SYSTEMOS=n
+# OPOIOS stage 4 (step 7): as aston, in load_init_program before launchd: the SystemOS cryptex volume over the OS root (union,
+# read only), the owner boot manifest from the two verified volumes, and the Data volume at /private/var from the seed on
+# RamBlock. Here OS and SystemOS are the RAM root store's windows (package/OpoiosRootStoreDisk.cpp), whose verification
+# answers the queries of package/SourceRootBinding.cpp. The volume UUIDs of OS and SystemOS come from the OS profile
+# ([root] os_volume_uuid E3F4AED0-..., systemos_volume_uuid 8B599D21-...). Stage 3 had them off: the restore ramdisk has
+# no cryptex ("offline owner SystemOS mount failed", device 2026-11-15).
+CONFIG_XNU_OWNER_CACHE_MOUNT=y
+CONFIG_XNU_OWNER_CACHE_STARTUP=y
+CONFIG_XNU_OWNER_BOOT_MANIFEST=y
+CONFIG_XNU_OWNER_DATA_MOUNT=y
+CONFIG_XNU_OWNER_UNION_SYSTEMOS=y
+# The Data volume of the seed this board boots: CI run 44390999272 (.github/workflows/opoios-data-seed.yml, 4 GiB, Setup done,
+# first-boot migration). The kernel mounts only this volume as Data; a new seed has a new UUID and needs a new kernel.
+CONFIG_XNU_OWNER_DATA_VOLUME_UUID="DA604258-7750-46D4-BD55-A4B3D6A429D7"
 CONFIG_XNU_NATIVE_LEGACY_DISPLAY=y
 # The board objects (display, GPU power, boot diagnostics) call into the Adreno driver, so it is linked; iOS stage A passes no GPU
 # arguments. Its accelerator binds the iPhone17,2 IOAcceleratorES (stage-aston-accelerator-abi.py).

@@ -4,7 +4,10 @@ schema_version = 2
 # UniXNU-sheng. This is the owner's ONLY daily phone: every boot is `fastboot boot` from RAM, nothing is ever flashed, and no
 # storage write path may be enabled (no [userdata], no native-ufs-root, no data-persist, no log, no persistent_data; the
 # device tree never enables &ufs). Check with OPOIOS scripts/check-safe-config.sh before every boot.
-# Stage 3: XNU to launchd with the IPSW's restore ramdisk as root (RamBlock, rd=md0-ramblock), no GPU/touch/Wi-Fi/DSP yet.
+# Stage 4 (OPOIOS docs/07-stage4-ram-root.md, step 7): the full iOS root from RAM. UEFI receives the RAM root store over USB
+# (OS and SystemOS, verified block by block, read only); the root is the OS volume (root-matching), SystemOS is mounted over it
+# and Data is the payload's packed Data seed on RamBlock, so every boot is a first boot. No GPU/touch/Wi-Fi/DSP yet.
+# (Stage 3 ran XNU to restored with the IPSW's restore ramdisk as root: RamBlock, rd=md0-ramblock.)
 # The package keeps the reference kit name "sheng" (installed as kits/sheng) and the "sheng-*" boot argument names: the shared
 # scripts and drivers address the board kit by that name.
 [board]
@@ -62,11 +65,16 @@ archives = [
 [kernel.prelink]
 # The profile's roots plus the USB device and host stacks (the reference board's list; the SoC's USB controller is the same).
 # The iPhone17,2 fileset has no com.apple.iokit.IOHIDEventDriver bundle (the class ships in IOHIDFamily).
-# com.apple.security.Image4 is a root for its personality (IOPlatformDevice "defaults"): as a mere dependency of AppleImage4 its
-# personality was dropped, Image4::start never ran, and AppleImage4's "userspace cork" (del2 state +64, byte +16) stayed shut,
-# so launchd's sysctl "activate" polled it with IOSleep(1) forever (phone run 2026-11-15 19:11 UTC). Same as the uke port.
+# OPOIOS stage 4: com.apple.security.Image4 is no root again, as on aston. Stage 3 made it one for its personality
+# (IOPlatformDevice "defaults"): the restore ramdisk's launchd runs the cryptex ignition and waited in AppleImage4's sysctl
+# ignition_blob for the "userspace cork" only Image4::start opens (phone run 2026-11-15 19:11 UTC; the uke port did the same),
+# and Image4::start needed /chosen/boot-manifest-hash. With the full root, CONFIG_XNU_OWNER_CACHE_STARTUP sets dyld's
+# no-ignition flag before launchd, so nothing waits for the cork; CONFIG_XNU_OWNER_BOOT_MANIFEST publishes the owner's
+# boot-manifest-hash in load_init_program and refuses to replace one already in /chosen ("offline owner SystemOS mount
+# failed"), so the ADT no longer carries it, and a started Image4 could run its magazine before that hash exists
+# ("Image4: unable to initialize magazine: 7", phone run 2026-11-15 22:57 UTC). Image4 stays in the fileset as AppleImage4's
+# library; package/Image4MonitorAbsent.c and its GOT slot stay as they are.
 roots = [
-  "com.apple.security.Image4",
   "com.apple.AppleFSCompression.AppleFSCompressionTypeZlib", "com.apple.driver.AppleARMPlatform", "com.apple.driver.AppleARMWatchdogTimer",
   "com.apple.driver.AppleAudioClockLibs", "com.apple.driver.AppleEffaceableStorage", "com.apple.driver.AppleIISController",
   "com.apple.driver.AppleM2ScalerCSCDriver", "com.apple.driver.AppleMobileFileIntegrity", "com.apple.driver.ApplePMGR",
@@ -104,33 +112,36 @@ packages = ["{uefi}", "{tree}/package", "{tree}/drivers/DarwinBoot", "{edk2}"]
 
 [payload]
 volume = "XUEYINGESP"
-# OPOIOS stage 3: the prelinked kernel (about 90 MiB) and the packed restore ramdisk (DBRDISK1, 184 MiB) as the RAM root
-# take about 274 MiB; the payload step wants 5 % room.
+# OPOIOS: the prelinked kernel (about 90 MiB), the packed Data seed (1.3 MiB) and the owner trust bundle (94 KiB). Kept at the
+# stage 3 size (the packed restore ramdisk was 184 MiB) so the boot image, and the payload pages ABL leaves at 0xBA013E000 that
+# the RAM root store goes around, stay as measured (store2, 2026-11-18).
 size_mib = 300
 loader = "firmware"
 title = "OPOIOS iOS 27"
 dram_size = "0x80000000"
 skip_setup_tool = "scripts/seed-data-skip-setup.py"
 panic_screen = true
-# OPOIOS stage 3: console, the CPU display path on the firmware framebuffer, keys, SMP; the root on the payload's RAM disk
-# (rd=md0-ramblock: the RamBlock disk is the root and bsd_init skips the sealed-root check, OddlyLabs/unixnu-fuxi r3-ramblock).
-# Removed from aston: native-source-storage, native-ufs-root (UFS root), sheng-log (log writer on userdata), sheng-data-persist
-# (Data store on userdata), sheng-aks, touch (Synaptics on aston; Goodix GT9966/GT9916 here), GPU, battery, ADSP, backlight
-# (AA551 panel on aston), Wi-Fi, cpufreq.
+# OPOIOS stage 4: console, the CPU display path on the firmware framebuffer, keys, SMP; the root is the OS volume of the RAM
+# root store ([payload.adt] root_match_volume_uuid, no rd=). Removed from aston: native-source-storage, native-ufs-root (UFS
+# root), sheng-log (log writer on userdata), sheng-data-persist (Data store on userdata), touch (Synaptics on aston; Goodix
+# GT9966/GT9916 here), GPU, battery, ADSP, backlight (AA551 panel on aston), Wi-Fi, cpufreq.
 kernel_args = [
   "-v", "serial=3", "debug=0x14e", "kt_fixed_zones=120", "-no_slto_panic", "use_contiguous_hint=0",
-  # OPOIOS: opoios-ram-root=1 starts the loader's RAM disk (NativeRamBlock) without UFS: package/SourceStorage.cpp registers
-  # only the source IOBlockStorageDevice and NativeRamBlock. Without it nothing starts the disk and the root wait panics
-  # (device 2026-11-15: "Failed to mount root device" after waiting for the volume UUID).
-  # opoios-sys-report=60: 60 s after the RAM root starts the kernel panics with one row: root, RAM disk traffic, processes by pid
-  # (package/SourceStorage.cpp), and prints that row every 15 s before. The panic ends the run; the phone then powers off.
-  # opoios-ram-root=2 (stage 4) does the same and then starts the RAM root store UEFI received over USB, if there is one:
-  # its OS and SystemOS windows as verified read-only disks (package/OpoiosRootStoreDisk.cpp). Without a store the STORE
-  # row of the report says why (st -2: no descriptor) and the boot goes on as with 1.
-  "rd=md0-ramblock", "opoios-ram-root=2", "opoios-sys-report=60",
+  # OPOIOS: opoios-ram-root=2 starts the loader's RAM disk (NativeRamBlock, here the Data seed) without UFS, then the RAM root
+  # store UEFI received over USB: its OS and SystemOS windows as verified read-only disks (package/OpoiosRootStoreDisk.cpp).
+  # package/SourceStorage.cpp registers only the source IOBlockStorageDevice, NativeRamBlock and OpoiosRootStoreDisk; NativeUfs
+  # is never registered. Without a store the STORE row of the report says why (st -2: no descriptor) and the root wait panics.
+  # opoios-sys-report=300: 300 s after the RAM disk starts the kernel panics with one row: root, RAM disk and store traffic,
+  # processes by pid (package/SourceStorage.cpp), and prints that row every 15 s before. The panic ends the run; the phone
+  # stays on the panic screen until the owner unplugs USB and holds Vol+ and Power. Stage 3's 60 s was about launchd's start.
+  "opoios-ram-root=2", "opoios-sys-report=300",
   "offline-mobile-graphics-load=1", "offline-mobile-graphics-client=1", "offline-legacy-register=1", "offline-legacy-gop=1",
   "offline-legacy-unit-scale=3", "offline-legacy-pm=1", "offline-legacy-validate=1", "offline-legacy-transfer=1",
   "offline-legacy-cpu-present=1", "offline-legacy-phase=4", "offline-key-events=1", "sheng-buttons=1",
+  # OPOIOS stage 4: sheng-aks=1 as on aston. offline-key-events starts the owned AppleKeyStore service on ephemeral Data
+  # (package/KeyStoreProbe.cpp); with sheng-aks it also answers the state queries of the full iOS (no passcode, nothing
+  # locked). It holds no keys and touches no storage; there is no SEP.
+  "sheng-aks=1",
   # OPOIOS: eight CPUs (smp=1). The "SMP hang" of 2026-11-15 was Image4's magazine panic (no boot-manifest-hash) stuck halfway
   # on SMP: its first screen lines were drawn and the other CPUs ran on. With boot-manifest-hash the 8-CPU boot reaches
   # restored_external like the one-CPU boot (device 2026-11-15 23:23).
@@ -146,11 +157,14 @@ kernel_args = [
 [payload.adt]
 chip_id = "8142"
 owned_memory_size = "0x130000000"
+# OPOIOS stage 4: the packed RAM disk is the Data seed of CI run 44390999272 (.github/workflows/opoios-data-seed.yml; volume
+# DA604258-7750-46D4-BD55-A4B3D6A429D7 = CONFIG_XNU_OWNER_DATA_VOLUME_UUID), with the owner trust bundle of that run
+# (StaticTrustCache, Cryptex1,SystemTrustCache and Cryptex1,AppTrustCache of the IPSW, unchanged). No persistent_data:
+# the ADT says ephemeral-storage and RamBlock keeps every write in RAM.
 packed_data_ramdisk = true
-# OPOIOS root: the restore ramdisk 043-69915-784.dmg (RestoreRamDisk of 24A446) as the packed RAM disk, with the restore
-# trust cache (043-69915-784.dmg.trustcache). Its single APFS volume "ramdisk" (raw APFS inside IM4P rdsk, 232.0 MiB,
-# 184.0 MiB nonzero), read with OPOIOS tools/restore_ramdisk_info.py:
-root_match_volume_uuid = "A21BAD53-1478-4E76-8EB4-19970D00EE06"
+# The root: the OS volume of the 24A446 OS image (the profile's [root] os_volume_uuid and its own root_match_volume_uuid),
+# served by the RAM root store's OS window. Stage 3 matched the restore ramdisk's volume A21BAD53-1478-4E76-8EB4-19970D00EE06.
+root_match_volume_uuid = "E3F4AED0-4454-4D5B-833C-E27E99C4F67B"
 unique_chip_id = "required"
 
 [bootimg]
@@ -192,12 +206,11 @@ vmm-present = 1
 # SM8550 has no CTRR.
 kernel-ctrr-to-be-enabled = 0
 
-[adt.chosen.bytes]
-# OPOIOS: the hash of the boot manifest (sha2-384, crypto-hash-method). Image4::start's magazine needs it: without it the start
-# panics "Image4: unable to initialize magazine: 7" (device 2026-11-15, one CPU), the userspace cork stays shut and launchd waits
-# in AppleImage4's sysctl ignition_blob. This boot has no Apple manifest (IM4M): the value is the owner's own, SHA-384 of the
-# fixed label "OPOIOS owner boot manifest v1 (no Apple ticket)", with no device identifier, and claims no Apple ticket.
-boot-manifest-hash = "ab094f555b2987c29f157a7b7f99a107e4d98cd395b73c560065e6c02b70c5d1e4b7833c00ca8cbbff5d6edbc40c81ee"
+# OPOIOS stage 4: no [adt.chosen.bytes] boot-manifest-hash. Stage 3 set the owner's fixed value (SHA-384 of the label "OPOIOS
+# owner boot manifest v1 (no Apple ticket)") for Image4::start's magazine. Now the kernel publishes /chosen/boot-manifest-hash
+# itself before launchd (CONFIG_XNU_OWNER_BOOT_MANIFEST, patches offline-owner-boot-manifest and offline-owner-systemos-mount):
+# SHA-384 over the domain "VerifiedRoot.OwnerBootSet.v1" and the SHA-384 of the OS and SystemOS signed policy headers, which
+# the RAM root store verified. It refuses to replace a value already in /chosen, so the ADT must carry none.
 
 [adt.buttons.string]
 compatible = "buttons"

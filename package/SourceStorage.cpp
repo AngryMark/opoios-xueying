@@ -433,14 +433,15 @@ static void opoios_sys_report_start(void)
     }
 }
 
-// OPOIOS: the loader's RAM disk as the only storage (stage 3 RAM root, rd=md0-ramblock). With opoios-ram-root=1 and
-// the source-storage argument off, only the source IOBlockStorageDevice and NativeRamBlock are registered and the RAM
-// disk is started on the platform root. NativeUfs is never registered, created or started, so nothing reaches the
-// UFS controller; the root policies (they describe a UFS root) are not loaded and no log writer runs. NativeRamBlock
+// OPOIOS: RAM as the only storage. With opoios-ram-root=1 and the source-storage argument off, only the source
+// IOBlockStorageDevice and NativeRamBlock are registered and the loader's RAM disk is started on the platform root (stage 3:
+// the restore ramdisk as the root, rd=md0-ramblock). NativeUfs is never registered, created or started, so nothing reaches
+// the UFS controller; the root policies (they describe a UFS root) are not loaded and no log writer runs. NativeRamBlock
 // opens the UFS store only with sheng-data-persist (storeMode), which this board never passes.
 // opoios-ram-root=2 (stage 4) also registers OpoiosRootStoreDisk and, after the RAM disk, starts the RAM root store that
-// UEFI received over USB: its OS and SystemOS windows as verified read-only disks (OpoiosRootStoreDisk.cpp). A missing or
-// bad store is reported in the STORE row, not a panic, so the rest of the boot still shows how far it got.
+// UEFI received over USB: its OS and SystemOS windows as verified read-only disks (OpoiosRootStoreDisk.cpp). With the full
+// root (step 7) the RAM disk is the Data seed and the root is the store's OS volume (root-matching). A missing or bad store
+// is reported in the STORE row, not a panic here; the root wait then fails on its own.
 static void opoios_ram_root_start(void)
 {
     unsigned enabled = 0;
