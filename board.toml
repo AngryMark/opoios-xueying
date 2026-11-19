@@ -125,10 +125,10 @@ title = "OPOIOS iOS 27"
 dram_size = "0x80000000"
 skip_setup_tool = "scripts/seed-data-skip-setup.py"
 panic_screen = true
-# OPOIOS stage 4: console, the CPU display path on the firmware framebuffer, keys, SMP; the root is the OS volume of the RAM
-# root store ([payload.adt] root_match_volume_uuid, no rd=). Removed from aston: native-source-storage, native-ufs-root (UFS
-# root), sheng-log (log writer on userdata), sheng-data-persist (Data store on userdata), touch (Synaptics on aston; Goodix
-# GT9966/GT9916 here), GPU, battery, ADSP, backlight (AA551 panel on aston), Wi-Fi, cpufreq.
+# OPOIOS stage 4/5: console, the CPU display path on the firmware framebuffer, keys, touch (the inner panel's Goodix GT9966),
+# SMP; the root is the OS volume of the RAM root store ([payload.adt] root_match_volume_uuid, no rd=). Removed from aston:
+# native-source-storage, native-ufs-root (UFS root), sheng-log (log writer on userdata), sheng-data-persist (Data store on
+# userdata), GPU, battery, ADSP, backlight (AA551 panel on aston), Wi-Fi, cpufreq.
 kernel_args = [
   "-v", "serial=3", "debug=0x14e", "kt_fixed_zones=120", "-no_slto_panic", "use_contiguous_hint=0",
   # OPOIOS: opoios-ram-root=2 starts the loader's RAM disk (NativeRamBlock, here the Data seed) without UFS, then the RAM root
@@ -146,6 +146,14 @@ kernel_args = [
   # (package/KeyStoreProbe.cpp); with sheng-aks it also answers the state queries of the full iOS (no passcode, nothing
   # locked). It holds no keys and touches no storage; there is no SEP.
   "sheng-aks=1",
+  # OPOIOS stage 5: touch, as aston runs it. sheng-touch=4 runs package/TouchProbe.cpp through the report loop on the inner
+  # panel's Goodix GT9966 (package/GoodixBerlin.c: identification without a write; its only write is one 0 to the touch data
+  # buffer after each event); offline-hid-input=1 offline-hid-home=1 start NativeHidInput (IOHIDFamily) and sheng-touch-hid=1
+  # sends the contacts through it. sheng-touch-flip=6 (swap the axes, mirror Y): the controller reports in Android's portrait
+  # frame of the inner panel (2268 x 2440, installOrientation ROTATION_270) and iOS draws into the panel's native 2440 x 2268
+  # scan; the camera hole, top right in Android, is top left on the framebuffer. Checked on the phone: store5 (touch works,
+  # rotated) and store6 ("touch works well and precisely"), 2026-11-19.
+  "sheng-touch=4", "sheng-touch-hid=1", "offline-hid-input=1", "offline-hid-home=1", "sheng-touch-flip=6",
   # OPOIOS: eight CPUs (smp=1). The "SMP hang" of 2026-11-15 was Image4's magazine panic (no boot-manifest-hash) stuck halfway
   # on SMP: its first screen lines were drawn and the other CPUs ran on. With boot-manifest-hash the 8-CPU boot reaches
   # restored_external like the one-CPU boot (device 2026-11-15 23:23).
